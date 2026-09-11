@@ -27,7 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
+import os
+import tempfile
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -80,6 +82,18 @@ BLOCKED_IP_NETWORKS = [
     ipaddress.ip_network('fe80::/10'),         # Link-local
     ipaddress.ip_network('ff00::/8'),          # Multicast
 ]
+
+# Maximum number of redirects followed for a single fetch. Every hop is
+# re-validated from scratch, so this only bounds the work, not the safety.
+MAX_REDIRECTS = 5
+
+
+@dataclass
+class _Redirect:
+    """Internal marker: a tier saw a 3xx and refused to follow it itself."""
+
+    location: str
+
 
 BLOCKED_HOSTNAMES = {
     "localhost",
@@ -139,6 +153,18 @@ class SafeDNSResolver:
         # Check hostname blocklist
         if hostname.lower() in BLOCKED_HOSTNAMES:
             raise SecurityError(f"Blocked hostname: {hostname}")
+
+        # An IP literal is validated as-is. Passing it through getaddrinfo
+        # would let a hostile (or rebinding) resolver launder 127.0.0.1 into
+        # something that looks public.
+        try:
+            literal_ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            literal_ip = None
+
+        if literal_ip is not None:
+            self._validate_ip(str(literal_ip), hostname)
+            return hostname, str(literal_ip)
 
         # Check cache first
         cached_ips = self._get_cached(hostname)
@@ -228,11 +254,12 @@ class SafeDNSResolver:
         parsed = urlparse(url)
         original_hostname = parsed.hostname
 
-        # Replace hostname with IP in netloc
+        # Replace hostname with IP in netloc (IPv6 literals need brackets)
+        host_part = f"[{ip}]" if ":" in ip else ip
         if parsed.port:
-            new_netloc = f"{ip}:{parsed.port}"
+            new_netloc = f"{host_part}:{parsed.port}"
         else:
-            new_netloc = ip
+            new_netloc = host_part
 
         # Rebuild URL with IP
         url_with_ip = urlunparse((
@@ -483,10 +510,12 @@ class WebFetcher:
         self.sanitizer = ContentSanitizer()
         self.cache = ContentCache(ttl_seconds=3600)
 
+        # Redirects are followed by fetch() itself, one validated hop at a
+        # time. httpx must never follow them on its own: it would bypass every
+        # SSRF check after the first URL.
         self._http_client = httpx.Client(
             timeout=self.settings.web_fetch_timeout,
-            follow_redirects=True,
-            max_redirects=5,
+            follow_redirects=False,
         )
 
     def fetch(
@@ -496,7 +525,12 @@ class WebFetcher:
         max_tier: int = 2,  # 1=httpx, 2=curl, 3=playwright
     ) -> FetchResult:
         """
-        Fetch URL content with multi-tier fallback.
+        Fetch URL content with multi-tier fallback and validated redirects.
+
+        Redirects are never followed by the transport. Each hop comes back to
+        this method, which re-runs the full validation chain (scheme, hostname
+        blocklist, DNS resolution, resolved-IP ranges, domain policy) against
+        the new destination before any request is made to it.
 
         Args:
             url: URL to fetch
@@ -507,62 +541,92 @@ class WebFetcher:
             FetchResult with content and metadata
 
         Raises:
-            SecurityError: If URL fails security checks
+            SecurityError: If any URL in the chain fails security checks, or
+                if the chain exceeds MAX_REDIRECTS
             FetchError: If all tiers fail
         """
-        # Security validations FIRST - returns validated IP to use
-        hostname, validated_ip = self.ssrf_validator.validate(url)
-        self.domain_validator.validate(url)
-
-        # Build URL with validated IP to prevent DNS rebinding
-        safe_url, original_host = self.ssrf_validator.dns_resolver.build_url_with_ip(
-            url, validated_ip
-        )
-
-        # Check cache
+        # Check cache (keyed on the URL the caller asked for)
         if use_cache:
             cached = self.cache.get(url)
             if cached:
                 logger.debug(f"Cache hit for {url}")
                 return cached
 
-        # Try tiers in order (using safe_url with validated IP)
-        errors = []
+        current_url = url
+        errors: list[str] = []
 
+        for hop in range(MAX_REDIRECTS + 1):
+            # Security validations FIRST, on every hop - returns validated IP
+            hostname, validated_ip = self.ssrf_validator.validate(current_url)
+            self.domain_validator.validate(current_url)
+
+            # Build URL with validated IP to prevent DNS rebinding
+            safe_url, original_host = self.ssrf_validator.dns_resolver.build_url_with_ip(
+                current_url, validated_ip
+            )
+
+            outcome = self._fetch_one_hop(
+                safe_url, original_host, current_url, max_tier, errors
+            )
+
+            if isinstance(outcome, _Redirect):
+                next_url = urljoin(current_url, outcome.location)
+                logger.debug(f"Redirect {hop + 1}: {current_url} -> {next_url}")
+                current_url = next_url
+                continue
+
+            if use_cache:
+                self.cache.set(url, outcome)
+            return outcome
+
+        raise SecurityError(
+            f"Too many redirects (limit {MAX_REDIRECTS}) starting from {url}"
+        )
+
+    def _fetch_one_hop(
+        self,
+        safe_url: str,
+        original_host: str,
+        current_url: str,
+        max_tier: int,
+        errors: list,
+    ):
+        """
+        Run the tier ladder for a single, already-validated destination.
+
+        Returns a FetchResult, or a _Redirect for the caller to validate.
+        """
         # Tier 1: httpx
         if max_tier >= 1:
             try:
-                result = self._fetch_httpx(safe_url, original_host, url)
-                if use_cache:
-                    self.cache.set(url, result)
-                return result
+                return self._fetch_httpx(safe_url, original_host, current_url)
+            except SecurityError:
+                raise
             except Exception as e:
                 errors.append(f"httpx: {e}")
-                logger.debug(f"Tier 1 (httpx) failed for {url}: {e}")
+                logger.debug(f"Tier 1 (httpx) failed for {current_url}: {e}")
 
         # Tier 2: curl with Chrome headers
         if max_tier >= 2:
             try:
-                result = self._fetch_curl(safe_url, original_host, url)
-                if use_cache:
-                    self.cache.set(url, result)
-                return result
+                return self._fetch_curl(safe_url, original_host, current_url)
+            except SecurityError:
+                raise
             except Exception as e:
                 errors.append(f"curl: {e}")
-                logger.debug(f"Tier 2 (curl) failed for {url}: {e}")
+                logger.debug(f"Tier 2 (curl) failed for {current_url}: {e}")
 
-        # Tier 3: playwright (if available and enabled)
-        # Note: Playwright uses original URL as it handles DNS internally
-        # but we've already validated the hostname resolves to a safe IP
+        # Tier 3: playwright (if available and enabled). The browser resolves
+        # and redirects on its own, so the URL it actually landed on is
+        # re-validated after the fact.
         if max_tier >= 3:
             try:
-                result = self._fetch_playwright(url)
-                if use_cache:
-                    self.cache.set(url, result)
-                return result
+                return self._fetch_playwright(current_url)
+            except SecurityError:
+                raise
             except Exception as e:
                 errors.append(f"playwright: {e}")
-                logger.debug(f"Tier 3 (playwright) failed for {url}: {e}")
+                logger.debug(f"Tier 3 (playwright) failed for {current_url}: {e}")
 
         raise FetchError(f"All tiers failed: {'; '.join(errors)}")
 
@@ -580,7 +644,21 @@ class WebFetcher:
         # Set Host header to original hostname (required for virtual hosting)
         headers = {"Host": original_host}
 
-        response = self._http_client.get(safe_url, headers=headers)
+        # follow_redirects is pinned per request, not just on the client, so a
+        # differently-configured client cannot re-enable transport-level
+        # redirect following.
+        response = self._http_client.get(
+            safe_url, headers=headers, follow_redirects=False
+        )
+
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("location")
+            if not location:
+                raise FetchError(
+                    f"Redirect status {response.status_code} without Location header"
+                )
+            return _Redirect(location)
+
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "text/html")
@@ -618,27 +696,57 @@ class WebFetcher:
             original_host: Original hostname for Host header
             original_url: Original URL for result reporting
         """
-        # Build curl command with headers
-        cmd = ["curl", "-sL", "--compressed", "-m", str(self.settings.web_fetch_timeout)]
+        # -L is deliberately absent: curl must not follow redirects either.
+        # Headers are dumped to a file so a 3xx can be handed back to fetch()
+        # for validation.
+        header_fd, header_path = tempfile.mkstemp(prefix="lag-curl-", suffix=".hdr")
+        os.close(header_fd)
 
-        # Add Host header for virtual hosting
-        cmd.extend(["-H", f"Host: {original_host}"])
+        try:
+            cmd = [
+                "curl",
+                "-sS",
+                "--compressed",
+                "--max-redirs",
+                "0",
+                "-D",
+                header_path,
+                "-m",
+                str(self.settings.web_fetch_timeout),
+            ]
 
-        for key, value in self.CHROME_HEADERS.items():
-            cmd.extend(["-H", f"{key}: {value}"])
+            # Add Host header for virtual hosting
+            cmd.extend(["-H", f"Host: {original_host}"])
 
-        cmd.append(safe_url)
+            for key, value in self.CHROME_HEADERS.items():
+                cmd.extend(["-H", f"{key}: {value}"])
 
-        # Execute curl (using subprocess with list args - no shell injection)
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.settings.web_fetch_timeout + 5,
-        )
+            cmd.append(safe_url)
 
-        if result.returncode != 0:
-            raise FetchError(f"curl failed: {result.stderr}")
+            # Execute curl (using subprocess with list args - no shell injection)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.settings.web_fetch_timeout + 5,
+            )
+
+            if result.returncode != 0:
+                raise FetchError(f"curl failed: {result.stderr}")
+
+            status_code, location = self._parse_curl_headers(header_path)
+        finally:
+            try:
+                os.unlink(header_path)
+            except OSError:
+                pass
+
+        if 300 <= status_code < 400:
+            if not location:
+                raise FetchError(
+                    f"Redirect status {status_code} without Location header"
+                )
+            return _Redirect(location)
 
         content = result.stdout
 
@@ -653,11 +761,42 @@ class WebFetcher:
             url=original_url,  # Return original URL
             content=content,
             content_type="text/html",
-            status_code=200,
+            status_code=status_code,
             tier_used="curl",
             fetched_at=datetime.utcnow().isoformat(),
             metadata={},
         )
+
+    @staticmethod
+    def _parse_curl_headers(header_path: str) -> Tuple[int, Optional[str]]:
+        """Parse curl's dumped response headers into (status, location)."""
+        try:
+            with open(header_path, "r", errors="replace") as f:
+                raw = f.read()
+        except OSError as e:
+            raise FetchError(f"Could not read curl response headers: {e}")
+
+        status_code = 0
+        location: Optional[str] = None
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper().startswith("HTTP/"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    status_code = int(parts[1])
+                    location = None  # new response block
+            elif ":" in line:
+                name, _, value = line.partition(":")
+                if name.strip().lower() == "location":
+                    location = value.strip()
+
+        if status_code == 0:
+            raise FetchError("curl returned no parsable status line")
+
+        return status_code, location
 
     def _fetch_playwright(self, url: str) -> FetchResult:
         """Tier 3: Full browser rendering with Playwright."""
@@ -676,6 +815,13 @@ class WebFetcher:
 
                 if not response or response.status >= 400:
                     raise FetchError(f"Page load failed: {response.status if response else 'no response'}")
+
+                # Playwright follows redirects internally, so re-validate the
+                # URL the browser actually landed on before using the content.
+                final_url = page.url
+                if final_url != url:
+                    self.ssrf_validator.validate(final_url)
+                    self.domain_validator.validate(final_url)
 
                 content = page.content()
                 content = self.sanitizer.sanitize_html(content)
@@ -722,62 +868,18 @@ def fetch_url(
     """
     Fetch content from a URL with multi-tier fallback.
 
+    Delegates to the shared WebFetcher so every caller gets the same SSRF,
+    DNS-rebinding and redirect validation.
+
     Tiers:
     1. HTTPX (Standard HTTP)
     2. Curl (Impersonate Browser)
     3. Playwright (Headless Browser - JS support)
+
+    Note: `timeout` is accepted for backwards compatibility; the effective
+    timeout comes from WEB_FETCH_TIMEOUT.
     """
-    # Check cache
-    cache_key = hashlib.md5(url.encode()).hexdigest()
-    cache_path = CACHE_DIR / f"{cache_key}.json"
-
-    if use_cache and cache_path.exists():
-        try:
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-            # Check age (default 24h)
-            fetched_at = datetime.fromisoformat(data["fetched_at"])
-            if datetime.utcnow() - fetched_at < timedelta(hours=24):
-                logger.info(f"Cache hit for {url}")
-                return FetchResult(**data)
-        except Exception as e:
-            logger.warning(f"Cache read failed for {url}: {e}")
-
-    # Validate URL and SSRF protection
-    _validate_url(url)
-
-    error = None
-    result = None
-
-    # Tier 1: HTTPX
-    if max_tier >= 1:
-        try:
-            result = _fetch_httpx(url, timeout)
-        except Exception as e:
-            error = e
-            logger.debug(f"Tier 1 failed for {url}: {e}")
-
-    # Tier 2: Curl (via subprocess)
-    if not result and max_tier >= 2:
-        try:
-            result = _fetch_curl(url, timeout)
-        except Exception as e:
-            error = e
-            logger.debug(f"Tier 2 failed for {url}: {e}")
-
-    # Tier 3: Playwright (Not implemented in this snippet to keep deps light)
-    # Could be added if needed for JS-heavy sites
-
-    if not result:
-        raise FetchError(f"All fetch tiers failed. Last error: {error}")
-
-    # Cache result
-    if use_cache and result:
-        try:
-            cache_path.write_text(json.dumps(asdict(result)), encoding="utf-8")
-        except Exception as e:
-            logger.warning(f"Cache write failed: {e}")
-
-    return result
+    return get_web_fetcher().fetch(url, use_cache=use_cache, max_tier=max_tier)
 
 
 def perform_search(query: str, max_results: int = 5) -> str:
