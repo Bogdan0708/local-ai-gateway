@@ -165,6 +165,9 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
 | `API_KEY` | (required) | API key for authentication |
 | `PORT` | `8000` | Server port |
+| `HOST_DOCUMENTS_ROOT` | (unset) | Windows/host folder your documents live under, for the `/api/read-file` path-rewrite (e.g. a per-user Documents folder on the host). Leave unset to disable the rewrite. |
+| `CONTAINER_DOCUMENTS_ROOT` | `/data/documents` | Where `HOST_DOCUMENTS_ROOT` maps to inside this service. |
+| `ALLOWED_PATH_PREFIXES` | `/data` | `os.pathsep`-separated list of extra path prefixes `/api/read-file` may read from, beyond the configured documents/code dirs. |
 
 ### File Types
 

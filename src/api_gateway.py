@@ -12,6 +12,7 @@ Provides:
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -973,26 +974,38 @@ async def read_local_file(
     from pathlib import Path as PathLib
     settings = get_settings()
 
+    # Host -> container document-root mapping is deployment-specific, so it's
+    # configurable via env rather than baked in. HOST_DOCUMENTS_ROOT is the
+    # Windows/host folder your documents actually live under (e.g. a
+    # per-user Documents folder on the host); CONTAINER_DOCUMENTS_ROOT is
+    # where that maps to inside this service. Leave HOST_DOCUMENTS_ROOT
+    # unset to disable the host-path rewrite entirely (a bare "C:..." path
+    # is then left as-is and will simply fail the allowed-prefix check
+    # below).
+    HOST_DOCUMENTS_ROOT = os.environ.get("HOST_DOCUMENTS_ROOT", "")
+    CONTAINER_DOCUMENTS_ROOT = os.environ.get("CONTAINER_DOCUMENTS_ROOT", "/data/documents")
+
     # Sanitize path: Handle Windows paths sent to Linux container
     raw_path = file_request.path.strip('"\'')  # Strip quotes
     if raw_path.lower().startswith("c:"):
-        # Map C:\Users\godja -> /data/documents
-        if "users/godja" in raw_path.lower().replace("\\", "/"):
-             raw_path = raw_path.replace("\\", "/").replace("C:/Users/godja", "/data/documents").replace("c:/users/godja", "/data/documents")
-        else:
-             # Generic C mapping
-             raw_path = raw_path.replace("\\", "/").replace("C:", "/mnt/c").replace("c:", "/mnt/c")
-    
+        normalized = raw_path.replace("\\", "/")
+        if HOST_DOCUMENTS_ROOT and normalized.lower().startswith(HOST_DOCUMENTS_ROOT.lower()):
+            raw_path = CONTAINER_DOCUMENTS_ROOT + normalized[len(HOST_DOCUMENTS_ROOT):]
+        # else: no configured host root matches — leave raw_path as the
+        # normalized Windows path; it will be rejected by the allowed-prefix
+        # check below unless ALLOWED_PATH_PREFIXES was configured to permit it.
+
     file_path = PathLib(raw_path).absolute()
 
-    # Security: Allow reading from /data/documents and /data/code explicitly
+    # Security: Allow reading only from configured prefixes. Defaults to the
+    # container's own document/code dirs; extend via ALLOWED_PATH_PREFIXES
+    # (os.pathsep-separated) for deployment-specific mounts.
     allowed_prefixes = [
         str(settings.documents_path.absolute()),
         str(settings.code_path.absolute()),
         "/data/documents",
         "/data/code",
-        "/mnt/c",  # Allow any C drive access for convenience if mounted
-    ]
+    ] + [p for p in os.environ.get("ALLOWED_PATH_PREFIXES", "/data").split(os.pathsep) if p]
 
     # Normalize paths for comparison (remove trailing slashes, handle Windows/Linux separators)
     file_path_str = str(file_path).replace("\\", "/")
