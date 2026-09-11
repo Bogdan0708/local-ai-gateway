@@ -31,7 +31,11 @@ from slowapi.util import get_remote_address
 
 from .auth import TokenData, require_auth, require_local_or_auth
 from .config import get_settings
-from .file_service import FileIngestionService
+from .file_service import (
+    FileIngestionService,
+    FileValidator,
+    SecurityError as FileSecurityError,
+)
 from .memory import Document, get_memory
 from .web_fetcher import FetchError, SecurityError, fetch_url, perform_search
 from .mcp_bridge import router as mcp_router  # MCP bridge for PAI integration
@@ -955,6 +959,47 @@ async def run_research_agent(
 # === Internal File Reading API (localhost only) ===
 
 
+def _allowed_read_roots(settings) -> list[Path]:
+    """
+    Real, existing directories that /api/read-file may serve from.
+
+    Defaults to the container's own document/code dirs; extend via
+    ALLOWED_PATH_PREFIXES (os.pathsep-separated) for deployment-specific
+    mounts. Roots are resolved strictly: a configured root that does not
+    exist cannot contain anything, so it is dropped rather than trusted as a
+    string prefix.
+    """
+    configured = [
+        settings.documents_path,
+        settings.code_path,
+        Path("/data/documents"),
+        Path("/data/code"),
+    ] + [
+        Path(p)
+        for p in os.environ.get("ALLOWED_PATH_PREFIXES", "/data").split(os.pathsep)
+        if p
+    ]
+
+    roots: list[Path] = []
+    for root in configured:
+        try:
+            resolved = Path(root).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _is_within_allowed_roots(path: Path, roots: list[Path]) -> bool:
+    """True when `path` is one of `roots` or lives under one of them.
+
+    Uses real filesystem ancestry (Path.is_relative_to), not string prefixes,
+    so `/data/allowed-evil/x` is not accepted for the root `/data/allowed`.
+    """
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
 class ReadFileRequest(BaseModel):
     """Request to read a local file."""
     path: str = Field(..., description="Path to the file to read")
@@ -995,38 +1040,60 @@ async def read_local_file(
         # normalized Windows path; it will be rejected by the allowed-prefix
         # check below unless ALLOWED_PATH_PREFIXES was configured to permit it.
 
-    file_path = PathLib(raw_path).absolute()
-
-    # Security: Allow reading only from configured prefixes. Defaults to the
-    # container's own document/code dirs; extend via ALLOWED_PATH_PREFIXES
-    # (os.pathsep-separated) for deployment-specific mounts.
-    allowed_prefixes = [
-        str(settings.documents_path.absolute()),
-        str(settings.code_path.absolute()),
-        "/data/documents",
-        "/data/code",
-    ] + [p for p in os.environ.get("ALLOWED_PATH_PREFIXES", "/data").split(os.pathsep) if p]
-
-    # Normalize paths for comparison (remove trailing slashes, handle Windows/Linux separators)
-    file_path_str = str(file_path).replace("\\", "/")
-    allowed_prefixes = [p.replace("\\", "/") for p in allowed_prefixes]
-
-    is_allowed = any(
-        file_path_str.startswith(prefix)
-        for prefix in allowed_prefixes
-    )
-
-    if not is_allowed:
-        logger.warning(f"Access denied: {file_path_str} not in {allowed_prefixes}")
+    allowed_roots = _allowed_read_roots(settings)
+    if not allowed_roots:
+        logger.warning("No readable roots are configured; refusing file read")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Access denied. Path not allowed.",
+            detail="Access denied. Path not allowed.",
         )
 
-    if not file_path.exists():
+    # Normalise without requiring existence first, so a path outside the roots
+    # is refused with 403 whether or not it exists (no existence oracle).
+    try:
+        candidate = PathLib(raw_path).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(f"Rejected unresolvable read path: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Path not allowed.",
+        )
+
+    if not _is_within_allowed_roots(candidate, allowed_roots):
+        logger.warning("Access denied: resolved path is outside every allowed root")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Path not allowed.",
+        )
+
+    # Same filename policy as ingestion: extension allowlist plus blocked
+    # patterns (.env, *.pem, id_rsa, ...).
+    try:
+        validator = FileValidator()
+        validator.validate_extension(candidate)
+        validator.validate_filename(candidate)
+    except FileSecurityError as exc:
+        logger.warning(f"Access denied by filename policy: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied. {exc}",
+        )
+
+    # Strict resolution: the file must exist, and the fully symlink-resolved
+    # target must still sit inside an allowed root.
+    try:
+        file_path = PathLib(raw_path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"File not found: {file_path}",
+            detail="File not found.",
+        )
+
+    if not _is_within_allowed_roots(file_path, allowed_roots):
+        logger.warning("Access denied: symlink target is outside every allowed root")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Path not allowed.",
         )
 
     if not file_path.is_file():

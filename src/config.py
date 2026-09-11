@@ -161,6 +161,30 @@ class DomainConfig:
         return self._blocked
 
 
+# Safe defaults used when no whitelist file is present on disk. They mirror
+# config/file_whitelist.example.yaml so a clean checkout is usable but still
+# conservative.
+DEFAULT_ALLOWED_EXTENSIONS = [".txt", ".md", ".pdf", ".csv", ".json", ".yaml"]
+DEFAULT_BLOCKED_PATTERNS = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_rsa*",
+    "id_ed25519*",
+    "*.kdbx",
+    "credentials",
+    "credentials.*",
+    ".git/*",
+    ".ssh/*",
+    "*.sqlite",
+    "*.db",
+]
+
+
 class FileWhitelistConfig:
     """Load and manage file extension whitelist configuration."""
 
@@ -173,15 +197,35 @@ class FileWhitelistConfig:
         self._load()
 
     def _load(self) -> None:
-        """Load configuration from YAML file."""
-        if not self.config_path.exists():
-            return
+        """
+        Load configuration from YAML.
 
-        with open(self.config_path) as f:
-            data = yaml.safe_load(f) or {}
+        Resolution order: the operator's file, then the shipped example file,
+        then the in-code defaults. An absent file must never mean "allow
+        nothing" -- that silently breaks ingestion on a clean checkout.
+        """
+        source = None
+        if self.config_path.exists():
+            source = self.config_path
+        else:
+            example = self.config_path.with_name(
+                f"{self.config_path.stem}.example{self.config_path.suffix}"
+            )
+            if example.exists():
+                source = example
 
-        self._allowed_extensions = data.get("allowed_extensions", [])
-        self._blocked_patterns = data.get("blocked_patterns", [])
+        data: dict = {}
+        if source is not None:
+            with open(source) as f:
+                data = yaml.safe_load(f) or {}
+            self.config_path = source
+
+        self._allowed_extensions = data.get(
+            "allowed_extensions", list(DEFAULT_ALLOWED_EXTENSIONS)
+        )
+        self._blocked_patterns = data.get(
+            "blocked_patterns", list(DEFAULT_BLOCKED_PATTERNS)
+        )
         self._max_file_size_mb = data.get("max_file_size_mb", 50)
         self._max_total_storage_gb = data.get("max_total_storage_gb", 10)
 
