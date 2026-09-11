@@ -8,7 +8,7 @@ A private knowledge base with local file and web access. Runs entirely on your m
 
 ## Features
 
-- **Hybrid Search**: Combines BM25 keyword search with semantic vector search for 2-3x better retrieval
+- **Hybrid Search**: Combines BM25 keyword search with semantic vector search, with optional cross-encoder reranking
 - **Local File Access**: Index documents (PDF, Markdown, code) from your filesystem
 - **Secure Web Fetching**: Fetch web content with SSRF protection and domain whitelisting
 - **OpenAI-Compatible API**: Works with any client that supports the OpenAI API format
@@ -106,12 +106,44 @@ curl -X POST http://localhost:8000/v1/web/index \
 
 ## Security
 
+### Authentication
+
+Every endpoint requires a credential. Send the API key from `.env` as either
+header:
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/chat ...
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8000/v1/chat/completions ...
+```
+
+`/health` and `/mcp/health` are the only open endpoints.
+
+The internal endpoints (`/api/chat`, `/api/read-file`, `/mcp/*`) can
+additionally accept unauthenticated requests **from the loopback interface
+only**, and only when you opt in:
+
+```env
+ALLOW_LOOPBACK_UNAUTHENTICATED=true
+```
+
+It defaults to `false`. Leave it off unless the server is bound to
+`127.0.0.1`: the default bind is `0.0.0.0`, and a reverse proxy on the same
+host makes remote traffic look like loopback traffic. With the flag off,
+loopback callers must present the API key like anyone else.
+
 ### SSRF Protection
 
 The web fetcher blocks requests to:
 - localhost, 127.0.0.1, 0.0.0.0
 - Private networks (10.x, 172.16-31.x, 192.168.x)
-- Cloud metadata endpoints (169.254.169.254)
+- Link-local and cloud metadata endpoints (169.254.169.254)
+- IPv6 loopback, unique-local (fc00::/7) and link-local (fe80::/10)
+
+Redirects are not followed by the HTTP transport. Each hop is returned to the
+fetcher, which re-runs the full check (scheme, hostname blocklist, DNS
+resolution, resolved-IP ranges, domain policy) against the new destination
+before requesting it, and the chain is capped at 5 hops. The curl fallback
+runs without `-L` and is subject to the same loop.
 
 ### Domain Whitelist
 
@@ -119,9 +151,23 @@ Configure allowed domains in `config/allowed_domains.yaml`.
 
 ### File Security
 
-- Only whitelisted file types are indexed
-- Blocked: `.env`, credentials, private keys
-- Read-only mounts in Docker
+- Only whitelisted file types are indexed or read
+- Blocked: `.env`, credentials, private keys (`*.pem`, `id_rsa`, ...)
+- `/api/read-file` resolves the path (symlinks included) and requires it to be
+  a real descendant of a configured root, so `..` traversal, symlink escapes
+  and sibling directories that merely share a name prefix are all refused
+- The same extension allowlist and blocked-filename patterns apply to reads
+  and to ingestion
+
+The policy lives in `config/file_whitelist.yaml`. The repository ships
+`config/file_whitelist.example.yaml`; if you do not create your own file, the
+example is used, and if that is missing too the equivalent defaults in
+`src/config.py` apply (`.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.yaml`).
+Copy it to customise:
+
+```bash
+cp config/file_whitelist.example.yaml config/file_whitelist.yaml
+```
 
 ## Remote Access with Tailscale
 
@@ -139,18 +185,20 @@ tailscale ip -4
 # Example: 100.64.1.23
 ```
 
-### 3. Start with Docker
+### 3. Bind the Server to the Tailscale Interface
+
+There is no deployment directory in this repository; run the server directly
+and let Tailscale provide the private network.
 
 ```bash
-cd deploy
-TAILSCALE_IP=100.64.1.23 docker-compose up -d
+HOST=100.64.1.23 PORT=8000 python run.py
 ```
 
 ### 4. Access from Any Device
 
 ```bash
 curl -H "Authorization: Bearer YOUR_API_KEY" \
-  http://100.64.1.23:8080/health
+  http://100.64.1.23:8000/health
 ```
 
 ## Configuration
@@ -163,7 +211,9 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 | `LMSTUDIO_HOST` | `http://localhost:1234` | LM Studio API URL |
 | `LMSTUDIO_CHAT_MODEL` | `gpt-oss-120b` | Chat model name |
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
-| `API_KEY` | (required) | API key for authentication |
+| `API_KEY` | (required) | API key for authentication (`X-API-Key` or `Authorization: Bearer`) |
+| `ALLOW_LOOPBACK_UNAUTHENTICATED` | `false` | Allow unauthenticated calls to the internal endpoints from 127.0.0.1/::1 only |
+| `CORS_ALLOW_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated CORS origins |
 | `PORT` | `8000` | Server port |
 | `HOST_DOCUMENTS_ROOT` | (unset) | Windows/host folder your documents live under, for the `/api/read-file` path-rewrite (e.g. a per-user Documents folder on the host). Leave unset to disable the rewrite. |
 | `CONTAINER_DOCUMENTS_ROOT` | `/data/documents` | Where `HOST_DOCUMENTS_ROOT` maps to inside this service. |
@@ -171,16 +221,17 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 
 ### File Types
 
-Supported formats (see `config/file_whitelist.yaml`):
-- Documents: PDF, Markdown, TXT, HTML
-- Code: Python, JavaScript, TypeScript, Go, Rust, Java, C/C++, etc.
-- Config: JSON, YAML, TOML
+The shipped defaults (`config/file_whitelist.example.yaml`) are deliberately
+narrow: `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.yaml`. Add the code and
+config extensions you actually want indexed to your own
+`config/file_whitelist.yaml`; anything not listed is refused by both the
+ingestion pipeline and `/api/read-file`.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────┐
-│           Caddy (TLS + Auth)            │
+│      TLS terminator / VPN (optional)    │
 └────────────────┬────────────────────────┘
                  │
 ┌────────────────▼────────────────────────┐

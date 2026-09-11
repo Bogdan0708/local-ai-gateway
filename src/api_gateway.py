@@ -38,7 +38,10 @@ from .file_service import (
 )
 from .memory import Document, get_memory
 from .web_fetcher import FetchError, SecurityError, fetch_url, perform_search
-from .mcp_bridge import router as mcp_router  # MCP bridge for PAI integration
+from .mcp_bridge import (  # MCP bridge for PAI integration
+    health_router as mcp_health_router,
+    router as mcp_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,30 +49,52 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan handler."""
     logger.info("Starting Secure Local AI API Gateway")
+
+    settings = get_settings()
+    logger.info(f"LLM Provider: {settings.llm_provider}")
+    logger.info(f"Chat Model: {settings.active_chat_model}")
+
     yield
+
     logger.info("Shutting down Secure Local AI API Gateway")
 
 
+# There is exactly ONE application instance. It used to be instantiated a
+# second time further down, which silently discarded every route registered
+# before that point - the whole MCP bridge and /v1/web/search.
 app = FastAPI(
     title="Secure Local AI Gateway",
     description="OpenAI-compatible local AI API with RAG, memory, and web tools",
-    version="1.0.0",
+    version="0.1.0",
     lifespan=lifespan,
 )
+
+# Rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# CORS: restrictive by default. Override CORS_ALLOW_ORIGINS (comma-separated)
+# for other front-ends; "*" with credentials is deliberately not the default.
+_cors_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://localhost:5173"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
-# Include MCP bridge router for PAI integration
+# Include MCP bridge routers for PAI integration
 app.include_router(mcp_router)
+app.include_router(mcp_health_router)
 
 # === Request/Response Models ===
 
@@ -231,45 +256,6 @@ class HealthResponse(BaseModel):
     llm_provider: str
     llm_model: str
     memory_documents: int
-
-
-# === Application Setup ===
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    logger.info("Starting Secure Local AI API...")
-
-    # Initialize services
-    settings = get_settings()
-    logger.info(f"LLM Provider: {settings.llm_provider}")
-    logger.info(f"Chat Model: {settings.active_chat_model}")
-
-    yield
-
-    logger.info("Shutting down...")
-
-
-app = FastAPI(
-    title="Secure Local AI",
-    description="Private knowledge base with local file and web access",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-# Add rate limiting
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# Add CORS (restrictive by default)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
-)
 
 
 # === Helper Functions ===

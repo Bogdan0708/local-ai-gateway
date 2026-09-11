@@ -1,0 +1,39 @@
+# File ingestion policy (example).
+#
+# Copy to config/file_whitelist.yaml to customise. When no file_whitelist.yaml
+# exists the application falls back to this example, and then to the same
+# values hard-coded in src/config.py, so a clean checkout is usable without
+# silently allowing everything -- or nothing.
+
+# Extensions the ingestion pipeline and /api/read-file will accept.
+allowed_extensions:
+  - .txt
+  - .md
+  - .pdf
+  - .csv
+  - .json
+  - .yaml
+
+# Filenames that are never read or ingested, even inside an allowed root.
+# Matched with fnmatch against the file name and the tail of the path.
+blocked_patterns:
+  - .env
+  - .env.*
+  - "*.pem"
+  - "*.key"
+  - "*.p12"
+  - "*.pfx"
+  - id_rsa
+  - id_rsa*
+  - id_ed25519*
+  - "*.kdbx"
+  - credentials
+  - credentials.*
+  - .git/*
+  - .ssh/*
+  - "*.sqlite"
+  - "*.db"
+
+# Size limits (also enforced by MAX_FILE_SIZE_MB / MAX_TOTAL_STORAGE_GB).
+max_file_size_mb: 50
+max_total_storage_gb: 10

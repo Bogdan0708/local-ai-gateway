@@ -20,14 +20,24 @@ Usage in PAI:
     }
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, Depends, HTTPException
+
+from .auth import TokenData, require_local_or_auth
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/mcp", tags=["mcp-bridge"])
+# The bridge reaches the knowledge base and the agents, so it authenticates
+# exactly like the rest of the gateway. /health is registered separately and
+# stays open for liveness probes.
+router = APIRouter(
+    prefix="/mcp",
+    tags=["mcp-bridge"],
+    dependencies=[Depends(require_local_or_auth)],
+)
+health_router = APIRouter(prefix="/mcp", tags=["mcp-bridge"])
 
 
 class SearchRequest(BaseModel):
@@ -98,21 +108,33 @@ async def mcp_search(request: SearchRequest):
     """
     try:
         # Import here to avoid circular dependencies
-        from src.memory import knowledge_base
+        from .memory import get_memory
 
         logger.info(f"MCP search request: {request.query}")
 
         # Perform hybrid search
-        results = knowledge_base.search(
+        results = get_memory().search(
             query=request.query,
-            top_k=request.top_k,
-            use_reranking=request.use_reranking
+            k=request.top_k,
+            method="hybrid",
+            rerank=request.use_reranking,
         )
+
+        payload = [
+            {
+                "id": result.document.id,
+                "content": result.document.content,
+                "metadata": result.document.metadata,
+                "score": result.score,
+                "source": result.source,
+            }
+            for result in results
+        ]
 
         return SearchResponse(
             query=request.query,
-            results=results,
-            total=len(results)
+            results=payload,
+            total=len(payload)
         )
 
     except Exception as e:
@@ -144,25 +166,34 @@ async def mcp_ingest(request: IngestRequest):
     """
     try:
         # Import here to avoid circular dependencies
-        from src.memory import knowledge_base
-        from src.chunking import chunk_document
+        from .chunking import ChunkConfig, ChunkingStrategy, chunk_document
+        from .memory import Document, get_memory
 
         logger.info(f"MCP ingest request from: {request.metadata.get('source', 'unknown')}")
 
         # Chunk the content
+        config = ChunkConfig(strategy=ChunkingStrategy(request.chunk_strategy))
         chunks = chunk_document(
-            content=request.content,
-            strategy=request.chunk_strategy,
-            metadata=request.metadata
+            text=request.content,
+            filename=request.metadata.get("filename"),
+            config=config,
         )
 
+        documents = [
+            Document(
+                content=chunk.content,
+                metadata={**request.metadata, **chunk.metadata, "chunk_index": chunk.index},
+            )
+            for chunk in chunks
+        ]
+
         # Add to knowledge base
-        document_id = knowledge_base.add_chunks(chunks)
+        doc_ids = get_memory().add_documents(documents)
 
         return IngestResponse(
             status="success",
-            chunks_created=len(chunks),
-            document_id=document_id
+            chunks_created=len(documents),
+            document_id=doc_ids[0] if doc_ids else ""
         )
 
     except Exception as e:
@@ -194,7 +225,7 @@ async def mcp_invoke_agent(request: AgentRequest):
     """
     try:
         # Import here to avoid circular dependencies
-        from src.agents import create_agent
+        from .agents import create_agent
 
         logger.info(f"MCP agent invocation: {request.agent_type} - {request.task}")
 
@@ -212,7 +243,7 @@ async def mcp_invoke_agent(request: AgentRequest):
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
 
-@router.get("/health")
+@health_router.get("/health")
 async def mcp_health():
     """
     Health check endpoint for MCP bridge.
@@ -221,8 +252,8 @@ async def mcp_health():
         Status information about the bridge and dependencies
     """
     try:
-        # Check if knowledge base is accessible
-        from src.memory import knowledge_base
+        # Check if knowledge base is importable (no query, no model load)
+        from .memory import get_memory  # noqa: F401
 
         status = {
             "status": "healthy",
