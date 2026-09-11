@@ -31,6 +31,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# Addresses that count as "the machine itself". Hostnames are deliberately
+# excluded: request.client.host is always a numeric peer address.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+
 
 class TokenData(BaseModel):
     """JWT token payload data."""
@@ -360,35 +364,35 @@ async def require_local_or_auth(
     bearer_token: Optional[str] = Depends(get_bearer_token),
 ) -> TokenData:
     """
-    Allow access from localhost without auth, or require auth from remote.
+    Grant the implicit local identity only to genuine loopback callers that the
+    operator has explicitly opted in, otherwise require real credentials.
 
-    This is useful for internal UI endpoints that should work without
-    authentication when accessed locally but require auth remotely.
+    Both conditions must hold for the bypass:
+    1. ``request.client.host`` is a loopback address (127.0.0.1 or ::1), and
+    2. ``ALLOW_LOOPBACK_UNAUTHENTICATED`` is enabled (it is off by default).
+
+    A missing client address is treated as remote, not local. Every other
+    caller is delegated to :func:`require_auth`, which returns 401 when no
+    valid API key or bearer token is supplied.
     """
-    # FOR LOCAL DEV: Always allow to bypass Docker/Network auth issues
-    return TokenData(
-        sub="local_user",
-        exp=datetime.utcnow() + timedelta(hours=1),
-        iat=datetime.utcnow(),
-        type="local",
-        scopes=["*"],
-    )
+    settings = get_settings()
 
-    # Check if request is from localhost
-    client_host = request.client.host if request.client else None
-    is_local = client_host in ("127.0.0.1", "localhost", "::1", None)
-
-    if is_local:
-        # Allow localhost access without auth
-        return TokenData(
-            sub="local_user",
-            exp=datetime.utcnow() + timedelta(hours=1),
-            iat=datetime.utcnow(),
-            type="local",
-            scopes=["*"],
+    if settings.allow_loopback_unauthenticated:
+        client_host = request.client.host if request and request.client else None
+        if client_host in LOOPBACK_HOSTS:
+            return TokenData(
+                sub="local_user",
+                exp=datetime.utcnow() + timedelta(hours=1),
+                iat=datetime.utcnow(),
+                type="local",
+                scopes=["*"],
+            )
+        logger.debug(
+            "Loopback bypass enabled but caller %s is not loopback; requiring auth",
+            client_host,
         )
 
-    # Remote access requires auth
+    # Remote access (or bypass disabled) requires authentication.
     return await require_auth(request, api_key, bearer_token)
 
 

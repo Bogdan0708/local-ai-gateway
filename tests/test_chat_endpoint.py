@@ -1,12 +1,22 @@
 from unittest.mock import MagicMock, patch
+
+import pytest
 from fastapi.testclient import TestClient
 from src.api_gateway import app
 from src.auth import require_local_or_auth
 
-# Override auth to allow access
-app.dependency_overrides[require_local_or_auth] = lambda: {"sub": "test", "scopes": ["*"]}
-
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _bypass_auth():
+    """Override auth for this module only; never leak into other test files."""
+    app.dependency_overrides[require_local_or_auth] = lambda: {
+        "sub": "test",
+        "scopes": ["*"],
+    }
+    yield
+    app.dependency_overrides.pop(require_local_or_auth, None)
 
 def test_chat_endpoint_success():
     # Mock memory and LLM

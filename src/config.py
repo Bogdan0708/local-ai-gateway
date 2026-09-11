@@ -73,6 +73,13 @@ class Settings(BaseSettings):
         return self.openai_base_url.rstrip("/v1")
 
     # === Server ===
+    # When true, requests arriving on the loopback interface may skip
+    # authentication. Off by default: the server binds 0.0.0.0 out of the box,
+    # and a proxy can make remote traffic appear to come from 127.0.0.1.
+    allow_loopback_unauthenticated: bool = Field(
+        default=False,
+        description="Allow unauthenticated access from 127.0.0.1/::1 only",
+    )
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
     debug: bool = Field(default=False)
