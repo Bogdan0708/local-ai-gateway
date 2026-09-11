@@ -1,0 +1,215 @@
+"""
+Configuration management using Pydantic Settings.
+
+Loads configuration from environment variables and .env file.
+"""
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
+
+import yaml
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # === Security ===
+    jwt_secret: str = Field(..., description="Secret key for JWT signing")
+    api_key: str = Field(..., description="API key for authentication")
+    encryption_key: Optional[str] = Field(None, description="Key for encrypting sensitive data")
+
+    # === LLM Provider ===
+    llm_provider: str = Field(default="lmstudio", description="ollama, lmstudio, or openai-compatible")
+
+    # LM Studio (OpenAI-compatible)
+    lmstudio_host: str = Field(default="http://localhost:1234")
+    lmstudio_chat_model: str = Field(default="gpt-oss-120b")
+    lmstudio_embed_model: str = Field(default="nomic-embed-text")
+
+    # Ollama
+    ollama_host: str = Field(default="http://localhost:11434")
+    ollama_chat_model: str = Field(default="llama3.1")
+    ollama_embed_model: str = Field(default="nomic-embed-text")
+
+    # OpenAI-compatible generic
+    openai_base_url: str = Field(default="http://localhost:1234/v1")
+    openai_api_key: str = Field(default="lm-studio")
+
+    @property
+    def active_chat_model(self) -> str:
+        """Get active chat model based on provider."""
+        if self.llm_provider == "lmstudio":
+            return self.lmstudio_chat_model
+        elif self.llm_provider == "ollama":
+            return self.ollama_chat_model
+        return self.lmstudio_chat_model
+
+    @property
+    def active_embed_model(self) -> str:
+        """Get active embedding model based on provider."""
+        if self.llm_provider == "lmstudio":
+            return self.lmstudio_embed_model
+        elif self.llm_provider == "ollama":
+            return self.ollama_embed_model
+        return self.lmstudio_embed_model
+
+    @property
+    def active_host(self) -> str:
+        """Get active LLM host based on provider."""
+        if self.llm_provider == "lmstudio":
+            return self.lmstudio_host
+        elif self.llm_provider == "ollama":
+            return self.ollama_host
+        return self.openai_base_url.rstrip("/v1")
+
+    # === Server ===
+    host: str = Field(default="0.0.0.0")
+    port: int = Field(default=8000)
+    debug: bool = Field(default=False)
+
+    # === Rate Limiting ===
+    rate_limit_requests: int = Field(default=100, description="Max requests per period")
+    rate_limit_period: int = Field(default=3600, description="Rate limit period in seconds")
+
+    # === File Ingestion ===
+    max_file_size_mb: int = Field(default=50)
+    max_total_storage_gb: int = Field(default=10)
+    documents_path: Path = Field(default=Path("/data/documents"))
+    code_path: Path = Field(default=Path("/data/code"))
+
+    # === Web Fetcher ===
+    web_fetch_timeout: int = Field(default=30)
+    web_fetch_max_size_mb: int = Field(default=5)
+    web_fetch_rate_limit: int = Field(default=10, description="Requests per minute")
+
+    # === ChromaDB ===
+    chroma_persist_dir: Path = Field(default=Path("/data/chroma"))
+    chroma_collection_name: str = Field(default="local_ai_knowledge")
+
+    # === Paths ===
+    config_dir: Path = Field(default=Path("config"))
+    data_dir: Path = Field(default=Path("data"))
+    logs_dir: Path = Field(default=Path("data/logs"))
+
+    @field_validator("jwt_secret", "api_key")
+    @classmethod
+    def validate_secrets(cls, v: str) -> str:
+        """Ensure secrets are not placeholder values."""
+        if not v or v.startswith("your-") or len(v) < 32:
+            raise ValueError(
+                "Secret must be at least 32 characters. "
+                "Generate with: openssl rand -hex 32"
+            )
+        return v
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def max_total_storage_bytes(self) -> int:
+        return self.max_total_storage_gb * 1024 * 1024 * 1024
+
+    @property
+    def web_fetch_max_size_bytes(self) -> int:
+        return self.web_fetch_max_size_mb * 1024 * 1024
+
+
+class DomainConfig:
+    """Load and manage domain whitelist/blocklist configuration."""
+
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self._allowed: list[str] = []
+        self._blocked: list[str] = []
+        self._load()
+
+    def _load(self) -> None:
+        """Load configuration from YAML file."""
+        if not self.config_path.exists():
+            return
+
+        with open(self.config_path) as f:
+            data = yaml.safe_load(f) or {}
+
+        self._allowed = data.get("allowed", [])
+        self._blocked = data.get("blocked", [])
+
+    @property
+    def allowed(self) -> list[str]:
+        return self._allowed
+
+    @property
+    def blocked(self) -> list[str]:
+        return self._blocked
+
+
+class FileWhitelistConfig:
+    """Load and manage file extension whitelist configuration."""
+
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self._allowed_extensions: list[str] = []
+        self._blocked_patterns: list[str] = []
+        self._max_file_size_mb: int = 50
+        self._max_total_storage_gb: int = 10
+        self._load()
+
+    def _load(self) -> None:
+        """Load configuration from YAML file."""
+        if not self.config_path.exists():
+            return
+
+        with open(self.config_path) as f:
+            data = yaml.safe_load(f) or {}
+
+        self._allowed_extensions = data.get("allowed_extensions", [])
+        self._blocked_patterns = data.get("blocked_patterns", [])
+        self._max_file_size_mb = data.get("max_file_size_mb", 50)
+        self._max_total_storage_gb = data.get("max_total_storage_gb", 10)
+
+    @property
+    def allowed_extensions(self) -> list[str]:
+        return self._allowed_extensions
+
+    @property
+    def blocked_patterns(self) -> list[str]:
+        return self._blocked_patterns
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return self._max_file_size_mb * 1024 * 1024
+
+    @property
+    def max_total_storage_bytes(self) -> int:
+        return self._max_total_storage_gb * 1024 * 1024 * 1024
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Get cached settings instance."""
+    return Settings()
+
+
+@lru_cache
+def get_domain_config() -> DomainConfig:
+    """Get cached domain configuration."""
+    settings = get_settings()
+    return DomainConfig(settings.config_dir / "allowed_domains.yaml")
+
+
+@lru_cache
+def get_file_whitelist() -> FileWhitelistConfig:
+    """Get cached file whitelist configuration."""
+    settings = get_settings()
+    return FileWhitelistConfig(settings.config_dir / "file_whitelist.yaml")

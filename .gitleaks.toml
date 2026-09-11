@@ -1,0 +1,14 @@
+title = "gitleaks config for local-ai-gateway"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Obvious placeholders in docs/config examples"
+regexes = [
+  '''YOUR_API_KEY''',
+  '''your-jwt-secret-here-generate-with-openssl''',
+  '''your-api-key-here-generate-with-openssl''',
+  '''your-encryption-key-here''',
+  '''lm-studio''',
+]
