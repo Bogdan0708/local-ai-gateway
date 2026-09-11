@@ -81,7 +81,51 @@ BLOCKED_IP_NETWORKS = [
     ipaddress.ip_network('fc00::/7'),          # Unique local
     ipaddress.ip_network('fe80::/10'),         # Link-local
     ipaddress.ip_network('ff00::/8'),          # Multicast
+    ipaddress.ip_network('64:ff9b:1::/48'),    # NAT64 local-use (RFC 8215)
+    ipaddress.ip_network('2001:db8::/32'),     # Documentation
 ]
+
+# IPv6 forms that carry an IPv4 address inside them. An address in one of
+# these ranges is not itself a member of any IPv4 network, so membership tests
+# alone let ::ffff:169.254.169.254 or 64:ff9b::7f00:1 through while the packet
+# still reaches the internal host.
+NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network('64:ff9b::/96')
+NAT64_LOCAL_USE_PREFIX = ipaddress.ip_network('64:ff9b:1::/48')
+
+
+def embedded_addresses(ip: "ipaddress._BaseAddress"):
+    """
+    Yield (address, description) for an address and every IPv4 it embeds.
+
+    Covers IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible, 6to4 (2002::/16),
+    Teredo (2001::/32) and NAT64 (64:ff9b::/96) forms. The address itself is
+    always yielded first so the ordinary checks still run.
+    """
+    yield ip, "address"
+
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return
+
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        yield mapped, "IPv4-mapped target"
+
+    sixtofour = ip.sixtofour
+    if sixtofour is not None:
+        yield sixtofour, "6to4-embedded target"
+
+    teredo = ip.teredo
+    if teredo is not None:
+        yield teredo[0], "Teredo server"
+        yield teredo[1], "Teredo client"
+
+    if ip in NAT64_WELL_KNOWN_PREFIX or ip in NAT64_LOCAL_USE_PREFIX:
+        yield ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF), "NAT64-embedded target"
+
+    # ::a.b.c.d (deprecated IPv4-compatible form), excluding :: and ::1
+    packed = int(ip)
+    if 0xFFFFFFFF >= packed > 1:
+        yield ipaddress.IPv4Address(packed), "IPv4-compatible target"
 
 # Maximum number of redirects followed for a single fetch. Every hop is
 # re-validated from scratch, so this only bounds the work, not the safety.
@@ -215,12 +259,32 @@ class SafeDNSResolver:
         except ValueError:
             raise SecurityError(f"Invalid IP address: {ip_str}")
 
-        for blocked_net in BLOCKED_IP_NETWORKS:
-            if ip_obj in blocked_net:
-                raise SecurityError(
-                    f"SSRF blocked: {hostname} resolves to {ip_str} "
-                    f"(blocked network: {blocked_net})"
-                )
+        # Validate the address AND anything it tunnels to, so an IPv6 wrapper
+        # around an internal IPv4 address cannot slip past the IPv4 ranges.
+        for candidate, description in embedded_addresses(ip_obj):
+            for blocked_net in BLOCKED_IP_NETWORKS:
+                if candidate in blocked_net:
+                    raise SecurityError(
+                        f"SSRF blocked: {hostname} resolves to {ip_str} "
+                        f"({description} {candidate} in blocked network "
+                        f"{blocked_net})"
+                    )
+
+            # Belt and braces: catch ranges the explicit list does not name
+            # (documentation, benchmarking, CGNAT-style reservations, ...).
+            for attribute in (
+                "is_loopback",
+                "is_private",
+                "is_link_local",
+                "is_reserved",
+                "is_multicast",
+                "is_unspecified",
+            ):
+                if getattr(candidate, attribute, False):
+                    raise SecurityError(
+                        f"SSRF blocked: {hostname} resolves to {ip_str} "
+                        f"({description} {candidate} is {attribute[3:]})"
+                    )
 
     def _get_cached(self, hostname: str) -> Optional[List[str]]:
         """Get cached IPs if not expired."""
@@ -319,7 +383,7 @@ class SSRFValidator:
 
 
 class DomainValidator:
-    """Validates URLs against domain whitelist/blocklist."""
+    """Validates URLs against domain whitelist/blocklist (fail-closed)."""
 
     def __init__(self):
         self.config = get_domain_config()
@@ -342,13 +406,22 @@ class DomainValidator:
             if self._matches(hostname, pattern):
                 raise SecurityError(f"Domain blocked: {hostname}")
 
-        # Check whitelist
-        if self.config.allowed:
-            allowed = any(
-                self._matches(hostname, pattern) for pattern in self.config.allowed
+        # Check whitelist. An empty allowlist means "nothing is allowed", not
+        # "everything is allowed"; opting out is explicit and separate.
+        if get_settings().allow_all_domains:
+            return
+
+        if not self.config.allowed:
+            raise SecurityError(
+                "Domain allowlist is empty: refusing all outbound fetches. "
+                "Populate config/allowed_domains.yaml or set ALLOW_ALL_DOMAINS=true."
             )
-            if not allowed:
-                raise SecurityError(f"Domain not in whitelist: {hostname}")
+
+        allowed = any(
+            self._matches(hostname, pattern) for pattern in self.config.allowed
+        )
+        if not allowed:
+            raise SecurityError(f"Domain not in whitelist: {hostname}")
 
     def _matches(self, hostname: str, pattern: str) -> bool:
         """Check if hostname matches pattern (supports wildcards)."""
@@ -545,6 +618,14 @@ class WebFetcher:
                 if the chain exceeds MAX_REDIRECTS
             FetchError: If all tiers fail
         """
+        # The browser tier navigates on its own, so a caller cannot reach it
+        # unless the operator turned it on.
+        if max_tier >= 3 and not self.settings.allow_browser_tier:
+            logger.debug(
+                "Browser tier requested but ALLOW_BROWSER_TIER is off; capping at tier 2"
+            )
+            max_tier = 2
+
         # Check cache (keyed on the URL the caller asked for)
         if use_cache:
             cached = self.cache.get(url)
@@ -798,6 +879,29 @@ class WebFetcher:
 
         return status_code, location
 
+    def _guard_browser_route(self, route, request) -> None:
+        """
+        Playwright route handler: abort anything that fails validation.
+
+        The browser resolves and follows redirects itself, so this is the only
+        place the same SSRF and domain checks can be applied to what it
+        actually requests.
+        """
+        target = getattr(request, "url", None) or getattr(route, "request", None)
+        try:
+            self.ssrf_validator.validate(target)
+            self.domain_validator.validate(target)
+        except SecurityError as e:
+            logger.warning(f"Browser request aborted by policy: {e}")
+            route.abort()
+            return
+        except Exception as e:  # never let a handler error open the gate
+            logger.warning(f"Browser request aborted (validation error): {e}")
+            route.abort()
+            return
+
+        route.continue_()
+
     def _fetch_playwright(self, url: str) -> FetchResult:
         """Tier 3: Full browser rendering with Playwright."""
         try:
@@ -810,6 +914,11 @@ class WebFetcher:
             try:
                 page = browser.new_page()
                 page.set_default_timeout(self.settings.web_fetch_timeout * 1000)
+
+                # Validate every request the browser makes - the initial
+                # navigation, its redirects and every subresource - BEFORE it
+                # goes out. Installed before goto() on purpose.
+                page.route("**/*", self._guard_browser_route)
 
                 response = page.goto(url, wait_until="networkidle")
 
@@ -879,6 +988,11 @@ def fetch_url(
     Note: `timeout` is accepted for backwards compatibility; the effective
     timeout comes from WEB_FETCH_TIMEOUT.
     """
+    settings = get_settings()
+    if max_tier >= 3 and not settings.allow_browser_tier:
+        # Caller-supplied tier: never let API input reach the browser tier
+        # unless the operator enabled it.
+        max_tier = 2
     return get_web_fetcher().fetch(url, use_cache=use_cache, max_tier=max_tier)
 
 

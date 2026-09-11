@@ -51,7 +51,10 @@ def _fail_httpx(fetcher):
 
 
 @pytest.fixture
-def fetcher():
+def fetcher(settings_env):
+    # These tests exercise the IP-level checks; opt out of the domain
+    # allowlist so synthetic literal addresses are not refused earlier.
+    settings_env(ALLOW_ALL_DOMAINS="true")
     f = WebFetcher()
     f.ssrf_validator.clear_dns_cache()
     yield f

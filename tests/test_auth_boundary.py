@@ -36,7 +36,7 @@ def _read_file(client_addr, path, headers=None):
 
 
 def test_remote_unauthenticated_is_rejected(readable_file, settings_env):
-    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="true")
+    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="true", HOST="127.0.0.1")
     response = _read_file(REMOTE, readable_file)
     assert response.status_code == 401
 
@@ -48,10 +48,21 @@ def test_loopback_without_flag_is_rejected(readable_file, settings_env):
 
 
 def test_loopback_with_flag_is_allowed(readable_file, settings_env):
-    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="true")
+    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="true", HOST="127.0.0.1")
     response = _read_file(LOOPBACK, readable_file)
     assert response.status_code == 200
     assert response.json()["content"] == "synthetic fixture content"
+
+
+def test_flag_is_ignored_when_not_bound_to_loopback(readable_file, settings_env):
+    """A wildcard bind makes proxied remote traffic look local, so the flag
+    must not be honoured."""
+    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="true", HOST="0.0.0.0")
+    assert _read_file(LOOPBACK, readable_file).status_code == 401
+    assert (
+        _read_file(LOOPBACK, readable_file, {"X-API-Key": TEST_API_KEY}).status_code
+        == 200
+    )
 
 
 def test_remote_with_api_key_is_allowed(readable_file, settings_env):

@@ -76,6 +76,10 @@ class AgentRequest(BaseModel):
     agent_type: Literal["devops", "research"] = Field(..., description="Type of agent to invoke")
     task: str = Field(..., description="Task description")
     context: Optional[str] = Field(None, description="Additional context")
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Source documents/URLs for the research agent",
+    )
 
 
 class AgentResponse(BaseModel):
@@ -229,15 +233,22 @@ async def mcp_invoke_agent(request: AgentRequest):
 
         logger.info(f"MCP agent invocation: {request.agent_type} - {request.task}")
 
-        # Create and run agent
+        # Create and run agent. The two agents have different signatures:
+        # DevOpsAgent.run(task), ResearchAgent.run(query, sources).
         agent = create_agent(request.agent_type)
-        result = await agent.run(request.task)
+        if request.agent_type == "research":
+            result = await agent.run(request.task, request.sources)
+        else:
+            result = await agent.run(request.task)
 
         return AgentResponse(
             status=result.get("status", "completed"),
             result=result
         )
 
+    except ValueError as e:
+        logger.warning(f"Bad MCP agent request: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error in MCP agent invocation: {e}")
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")

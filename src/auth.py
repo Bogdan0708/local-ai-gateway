@@ -367,9 +367,10 @@ async def require_local_or_auth(
     Grant the implicit local identity only to genuine loopback callers that the
     operator has explicitly opted in, otherwise require real credentials.
 
-    Both conditions must hold for the bypass:
-    1. ``request.client.host`` is a loopback address (127.0.0.1 or ::1), and
-    2. ``ALLOW_LOOPBACK_UNAUTHENTICATED`` is enabled (it is off by default).
+    All three conditions must hold for the bypass:
+    1. ``request.client.host`` is a loopback address (127.0.0.1 or ::1),
+    2. ``ALLOW_LOOPBACK_UNAUTHENTICATED`` is enabled (off by default), and
+    3. ``HOST`` binds loopback only - otherwise the flag is logged and ignored.
 
     A missing client address is treated as remote, not local. Every other
     caller is delegated to :func:`require_auth`, which returns 401 when no
@@ -377,7 +378,15 @@ async def require_local_or_auth(
     """
     settings = get_settings()
 
-    if settings.allow_loopback_unauthenticated:
+    # The bypass is only sound when the server is reachable on loopback only.
+    # With a wildcard bind, a reverse proxy or NAT on the same host makes
+    # remote traffic arrive as 127.0.0.1, so the flag is ignored.
+    if settings.allow_loopback_unauthenticated and not settings.binds_loopback_only:
+        logger.warning(
+            "Ignoring ALLOW_LOOPBACK_UNAUTHENTICATED: HOST is %s, not loopback",
+            settings.host,
+        )
+    elif settings.allow_loopback_unauthenticated:
         client_host = request.client.host if request and request.client else None
         if client_host in LOOPBACK_HOSTS:
             return TokenData(

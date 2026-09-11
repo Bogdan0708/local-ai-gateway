@@ -77,3 +77,10 @@ def test_pem_inside_root_is_rejected(fixtures):
 def test_missing_file_is_not_found(fixtures):
     response = _read(fixtures / "allowed" / "nope.txt")
     assert response.status_code == 404
+
+
+def test_blocked_pattern_with_allowed_extension_is_rejected(fixtures):
+    """credentials.json has an allowed extension but a blocked name."""
+    target = fixtures / "allowed" / "credentials.json"
+    target.write_text('{"synthetic": "no real credentials"}')
+    assert _read(target).status_code == 403

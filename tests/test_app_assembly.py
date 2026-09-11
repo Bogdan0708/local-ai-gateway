@@ -124,3 +124,59 @@ def test_mcp_ingest_and_search_round_trip(settings_env):
     assert search.status_code == 200, search.text
     assert search.json()["total"] == 1
     assert search.json()["results"][0]["content"] == "synthetic chunk"
+
+
+def test_mcp_agent_invoke_passes_the_right_arguments(settings_env):
+    """The research agent takes (query, sources); devops takes (task)."""
+    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="false")
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    headers = {"X-API-Key": TEST_API_KEY}
+    devops, research = MagicMock(), MagicMock()
+    devops.run = AsyncMock(return_value={"status": "completed", "code": "x"})
+    research.run = AsyncMock(return_value={"status": "completed", "synthesis": "y"})
+
+    def fake_create_agent(agent_type, *args, **kwargs):
+        return devops if agent_type == "devops" else research
+
+    with patch("src.agents.create_agent", side_effect=fake_create_agent):
+        with TestClient(app, client=("203.0.113.7", 1234)) as client:
+            devops_response = client.post(
+                "/mcp/agents/invoke",
+                json={"agent_type": "devops", "task": "write a parser"},
+                headers=headers,
+            )
+            research_response = client.post(
+                "/mcp/agents/invoke",
+                json={
+                    "agent_type": "research",
+                    "task": "summarise the notes",
+                    "sources": ["doc-a", "doc-b"],
+                },
+                headers=headers,
+            )
+
+    assert devops_response.status_code == 200, devops_response.text
+    devops.run.assert_awaited_once_with("write a parser")
+
+    assert research_response.status_code == 200, research_response.text
+    research.run.assert_awaited_once_with("summarise the notes", ["doc-a", "doc-b"])
+
+
+def test_mcp_research_agent_without_sources_still_works(settings_env):
+    settings_env(ALLOW_LOOPBACK_UNAUTHENTICATED="false")
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    research = MagicMock()
+    research.run = AsyncMock(return_value={"status": "completed", "synthesis": "y"})
+
+    with patch("src.agents.create_agent", return_value=research):
+        with TestClient(app, client=("203.0.113.7", 1234)) as client:
+            response = client.post(
+                "/mcp/agents/invoke",
+                json={"agent_type": "research", "task": "summarise"},
+                headers={"X-API-Key": TEST_API_KEY},
+            )
+
+    assert response.status_code == 200, response.text
+    research.run.assert_awaited_once_with("summarise", [])

@@ -83,6 +83,20 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
     debug: bool = Field(default=False)
+    cors_allow_origins: str = Field(
+        default="http://localhost:3000,http://localhost:5173",
+        description="Comma-separated list of origins allowed to call the API",
+    )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """CORS origins as a list, empty entries dropped."""
+        return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
+
+    @property
+    def binds_loopback_only(self) -> bool:
+        """True when the server listens on loopback only."""
+        return self.host in ("127.0.0.1", "::1", "localhost")
 
     # === Rate Limiting ===
     rate_limit_requests: int = Field(default=100, description="Max requests per period")
@@ -95,6 +109,18 @@ class Settings(BaseSettings):
     code_path: Path = Field(default=Path("/data/code"))
 
     # === Web Fetcher ===
+    # Disable allowlist enforcement for outbound fetches. The blocklist and
+    # every SSRF/IP check still apply; only the domain allowlist is skipped.
+    allow_all_domains: bool = Field(
+        default=False,
+        description="Skip the domain allowlist (fail-open) for web fetches",
+    )
+    # Tier 3 uses a real browser, which resolves and navigates on its own.
+    # Off by default: callers cannot ask for it unless the operator enables it.
+    allow_browser_tier: bool = Field(
+        default=False,
+        description="Allow the Playwright (browser) fetch tier",
+    )
     web_fetch_timeout: int = Field(default=30)
     web_fetch_max_size_mb: int = Field(default=5)
     web_fetch_rate_limit: int = Field(default=10, description="Requests per minute")
@@ -132,6 +158,37 @@ class Settings(BaseSettings):
         return self.web_fetch_max_size_mb * 1024 * 1024
 
 
+# Mirrors config/allowed_domains.example.yaml, for the case where neither the
+# operator's file nor the example is on disk. The allowlist is enforced
+# fail-closed, so "no configuration" must not mean "fetch anything".
+DEFAULT_ALLOWED_DOMAINS = [
+    "*.wikipedia.org",
+    "*.python.org",
+    "developer.mozilla.org",
+    "*.readthedocs.io",
+    "pypi.org",
+    "github.com",
+    "*.github.com",
+    "raw.githubusercontent.com",
+    "stackoverflow.com",
+    "*.arxiv.org",
+    "arxiv.org",
+]
+DEFAULT_BLOCKED_DOMAINS = [
+    "*.local",
+    "*.internal",
+    "*.localdomain",
+    "metadata.google.internal",
+]
+
+
+def _example_path(config_path: Path) -> Path:
+    """Sibling ``<name>.example<suffix>`` path for a config file."""
+    return config_path.with_name(
+        f"{config_path.stem}.example{config_path.suffix}"
+    )
+
+
 class DomainConfig:
     """Load and manage domain whitelist/blocklist configuration."""
 
@@ -142,15 +199,28 @@ class DomainConfig:
         self._load()
 
     def _load(self) -> None:
-        """Load configuration from YAML file."""
-        if not self.config_path.exists():
-            return
+        """
+        Load configuration from YAML.
 
-        with open(self.config_path) as f:
-            data = yaml.safe_load(f) or {}
+        Resolution order: the operator's file, then the shipped example, then
+        the in-code defaults - the same order as the file whitelist.
+        """
+        source = None
+        if self.config_path.exists():
+            source = self.config_path
+        else:
+            example = _example_path(self.config_path)
+            if example.exists():
+                source = example
 
-        self._allowed = data.get("allowed", [])
-        self._blocked = data.get("blocked", [])
+        data: dict = {}
+        if source is not None:
+            with open(source) as f:
+                data = yaml.safe_load(f) or {}
+            self.config_path = source
+
+        self._allowed = data.get("allowed", list(DEFAULT_ALLOWED_DOMAINS))
+        self._blocked = data.get("blocked", list(DEFAULT_BLOCKED_DOMAINS))
 
     @property
     def allowed(self) -> list[str]:
@@ -208,9 +278,7 @@ class FileWhitelistConfig:
         if self.config_path.exists():
             source = self.config_path
         else:
-            example = self.config_path.with_name(
-                f"{self.config_path.stem}.example{self.config_path.suffix}"
-            )
+            example = _example_path(self.config_path)
             if example.exists():
                 source = example
 

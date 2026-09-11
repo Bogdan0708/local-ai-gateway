@@ -1,0 +1,31 @@
+# Web fetcher domain policy (example).
+#
+# Copy to config/allowed_domains.yaml to customise. When no allowed_domains.yaml
+# exists the application falls back to this example, and then to the same short
+# list hard-coded in src/config.py.
+#
+# The allowlist is enforced fail-closed: a domain that is not listed is
+# refused. An EMPTY allowlist refuses everything unless you explicitly set
+# ALLOW_ALL_DOMAINS=true, which disables allowlist enforcement entirely (the
+# blocklist and all SSRF/IP checks still apply).
+
+# Domains the fetcher may retrieve. "*." matches the domain and any subdomain.
+allowed:
+  - "*.wikipedia.org"
+  - "*.python.org"
+  - "developer.mozilla.org"
+  - "*.readthedocs.io"
+  - "pypi.org"
+  - "github.com"
+  - "*.github.com"
+  - "raw.githubusercontent.com"
+  - "stackoverflow.com"
+  - "*.arxiv.org"
+  - "arxiv.org"
+
+# Always refused, even if something else would allow them. Checked first.
+blocked:
+  - "*.local"
+  - "*.internal"
+  - "*.localdomain"
+  - "metadata.google.internal"

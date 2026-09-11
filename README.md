@@ -126,10 +126,10 @@ only**, and only when you opt in:
 ALLOW_LOOPBACK_UNAUTHENTICATED=true
 ```
 
-It defaults to `false`. Leave it off unless the server is bound to
-`127.0.0.1`: the default bind is `0.0.0.0`, and a reverse proxy on the same
-host makes remote traffic look like loopback traffic. With the flag off,
-loopback callers must present the API key like anyone else.
+It defaults to `false`, and it is ignored (with a warning at startup) unless
+`HOST` is `127.0.0.1`/`::1`: the default bind is `0.0.0.0`, and a reverse proxy
+on the same host makes remote traffic look like loopback traffic. With the flag
+off or ignored, loopback callers must present the API key like anyone else.
 
 ### SSRF Protection
 
@@ -138,6 +138,10 @@ The web fetcher blocks requests to:
 - Private networks (10.x, 172.16-31.x, 192.168.x)
 - Link-local and cloud metadata endpoints (169.254.169.254)
 - IPv6 loopback, unique-local (fc00::/7) and link-local (fe80::/10)
+- IPv6 forms that tunnel an internal IPv4 address: IPv4-mapped
+  (`::ffff:169.254.169.254`), 6to4 (`2002:7f00:1::1`), NAT64
+  (`64:ff9b::7f00:1`) and Teredo are decoded and the embedded address is
+  checked too
 
 Redirects are not followed by the HTTP transport. Each hop is returned to the
 fetcher, which re-runs the full check (scheme, hostname blocklist, DNS
@@ -145,9 +149,33 @@ resolution, resolved-IP ranges, domain policy) against the new destination
 before requesting it, and the chain is capped at 5 hops. The curl fallback
 runs without `-L` and is subject to the same loop.
 
-### Domain Whitelist
+### Domain Allowlist
 
-Configure allowed domains in `config/allowed_domains.yaml`.
+Outbound fetches are restricted to an allowlist, enforced **fail-closed**: a
+domain that is not listed is refused, and an *empty* allowlist refuses
+everything rather than everything-goes.
+
+The policy lives in `config/allowed_domains.yaml`. The repository ships
+`config/allowed_domains.example.yaml` (a short list of documentation and code
+hosts); if you do not create your own file, the example is used, and if that is
+missing too the equivalent defaults in `src/config.py` apply.
+
+```bash
+cp config/allowed_domains.example.yaml config/allowed_domains.yaml
+```
+
+To fetch arbitrary domains, opt out explicitly with `ALLOW_ALL_DOMAINS=true`.
+That skips only the allowlist — the blocklist and every SSRF/IP check still
+apply.
+
+### Browser Fetch Tier
+
+Tier 3 uses a real headless browser, which resolves DNS and follows redirects
+itself. It is disabled by default (`ALLOW_BROWSER_TIER=false`), so an API
+caller asking for `max_tier: 3` is silently capped at tier 2. When it is
+enabled, every request the browser makes — the navigation, its redirects and
+each subresource — is intercepted and aborted unless it passes the same
+SSRF and domain checks.
 
 ### File Security
 
@@ -212,7 +240,9 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 | `LMSTUDIO_CHAT_MODEL` | `gpt-oss-120b` | Chat model name |
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
 | `API_KEY` | (required) | API key for authentication (`X-API-Key` or `Authorization: Bearer`) |
-| `ALLOW_LOOPBACK_UNAUTHENTICATED` | `false` | Allow unauthenticated calls to the internal endpoints from 127.0.0.1/::1 only |
+| `ALLOW_LOOPBACK_UNAUTHENTICATED` | `false` | Allow unauthenticated calls to the internal endpoints from 127.0.0.1/::1 only. Ignored (with a warning) unless `HOST` binds loopback. |
+| `ALLOW_ALL_DOMAINS` | `false` | Skip the outbound domain allowlist. SSRF/IP checks and the blocklist still apply. |
+| `ALLOW_BROWSER_TIER` | `false` | Allow the Playwright browser fetch tier |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated CORS origins |
 | `PORT` | `8000` | Server port |
 | `HOST_DOCUMENTS_ROOT` | (unset) | Windows/host folder your documents live under, for the `/api/read-file` path-rewrite (e.g. a per-user Documents folder on the host). Leave unset to disable the rewrite. |

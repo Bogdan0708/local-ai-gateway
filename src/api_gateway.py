@@ -56,6 +56,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(f"LLM Provider: {settings.llm_provider}")
     logger.info(f"Chat Model: {settings.active_chat_model}")
 
+    if settings.allow_loopback_unauthenticated and not settings.binds_loopback_only:
+        logger.warning(
+            "ALLOW_LOOPBACK_UNAUTHENTICATED is set but HOST is %s, not loopback. "
+            "The flag is ignored: a proxy or NAT on this host would make remote "
+            "traffic look local. Bind to 127.0.0.1 to use it.",
+            settings.host,
+        )
+
     yield
 
     logger.info("Shutting down Secure Local AI API Gateway")
@@ -77,13 +85,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS: restrictive by default. Override CORS_ALLOW_ORIGINS (comma-separated)
 # for other front-ends; "*" with credentials is deliberately not the default.
-_cors_origins = [
-    origin.strip()
-    for origin in os.environ.get(
-        "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://localhost:5173"
-    ).split(",")
-    if origin.strip()
-]
+_cors_origins = get_settings().cors_origin_list
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
