@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     # OpenAI-compatible generic
     openai_base_url: str = Field(default="http://localhost:1234/v1")
     openai_api_key: str = Field(default="lm-studio")
+    openai_chat_model: Optional[str] = Field(default=None)
+
+    @property
+    def active_chat_base_url(self) -> str:
+        """Full API prefix for an OpenAI-compatible chat backend."""
+        if self.llm_provider == "lmstudio":
+            return f"{self.lmstudio_host.rstrip('/')}/v1"
+        return self.openai_base_url.rstrip("/")
 
     @property
     def active_chat_model(self) -> str:
@@ -52,7 +60,7 @@ class Settings(BaseSettings):
             return self.lmstudio_chat_model
         elif self.llm_provider == "ollama":
             return self.ollama_chat_model
-        return self.lmstudio_chat_model
+        return self.openai_chat_model or self.lmstudio_chat_model
 
     @property
     def active_embed_model(self) -> str:
@@ -70,7 +78,7 @@ class Settings(BaseSettings):
             return self.lmstudio_host
         elif self.llm_provider == "ollama":
             return self.ollama_host
-        return self.openai_base_url.rstrip("/v1")
+        return self.openai_base_url.rstrip("/").removesuffix("/v1")
 
     # === Server ===
     # When true, requests arriving on the loopback interface may skip

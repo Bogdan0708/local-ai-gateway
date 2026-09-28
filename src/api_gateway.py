@@ -111,7 +111,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     """OpenAI-compatible chat request."""
 
-    model: str = Field(default="gpt-oss-120b")
+    model: str = Field(default_factory=lambda: get_settings().active_chat_model)
     messages: list[Message]
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: Optional[int] = Field(default=None)
@@ -269,7 +269,7 @@ async def call_llm(
     temperature: float = 0.7,
     max_tokens: Optional[int] = None,
 ) -> dict:
-    """Call the LLM (LM Studio or Ollama)."""
+    """Call the configured LLM backend without managing its process or decoding mode."""
     settings = get_settings()
 
     if settings.llm_provider == "ollama":
@@ -298,9 +298,9 @@ async def call_llm(
         # LM Studio / OpenAI-compatible API
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
-                f"{settings.lmstudio_host}/v1/chat/completions",
+                f"{settings.active_chat_base_url}/chat/completions",
                 json={
-                    "model": model or settings.lmstudio_chat_model,
+                    "model": model or settings.active_chat_model,
                     "messages": messages,
                     "temperature": temperature,
                     **({"max_tokens": max_tokens} if max_tokens else {}),
@@ -416,9 +416,9 @@ async def _stream_openai_compatible(
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
             "POST",
-            f"{settings.lmstudio_host}/v1/chat/completions",
+            f"{settings.active_chat_base_url}/chat/completions",
             json={
-                "model": model or settings.lmstudio_chat_model,
+                "model": model or settings.active_chat_model,
                 "messages": messages,
                 "temperature": temperature,
                 "stream": True,
@@ -426,6 +426,7 @@ async def _stream_openai_compatible(
             },
             headers={"Authorization": f"Bearer {settings.openai_api_key}"},
         ) as response:
+            response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data: "):
                     continue

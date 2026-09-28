@@ -43,6 +43,28 @@ OLLAMA_HOST=http://localhost:11434
 OLLAMA_CHAT_MODEL=llama3.1
 ```
 
+For a separately managed llama-server, use the generic backend:
+
+```env
+LLM_PROVIDER=openai-compatible
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+OPENAI_CHAT_MODEL=qwen-local
+OPENAI_API_KEY=replace-with-your-backend-key
+```
+
+Use the actual server port and served model alias. `OPENAI_BASE_URL` is the
+complete API prefix, including `/v1`; it may include a reverse-proxy prefix.
+An explicit request model overrides `OPENAI_CHAT_MODEL`. When unset, the
+generic model setting retains the legacy `LMSTUDIO_CHAT_MODEL` fallback.
+
+This configures chat routing only. It does not launch the backend or disable
+server-side speculation. On this Strix Halo WSL machine, MTP/DFlash are excluded
+following repeated host crashes; see the
+[September 28 incident and benchmark record](docs/wsl-stability-2026-09-28.md).
+Use `use_rag: false` for chat without retrieval until a separate embedding
+workflow has been configured and verified. This change does not add tool-call
+forwarding, a ComfyUI queue, or model lifecycle management.
+
 ### 3. Start the Server
 
 ```bash
@@ -235,7 +257,10 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROVIDER` | `lmstudio` | LLM provider (lmstudio, ollama) |
+| `LLM_PROVIDER` | `lmstudio` | LLM provider (lmstudio, ollama, openai-compatible) |
+| `OPENAI_BASE_URL` | `http://localhost:1234/v1` | Complete API prefix for generic chat backends |
+| `OPENAI_CHAT_MODEL` | (unset) | Generic chat model alias; falls back to `LMSTUDIO_CHAT_MODEL` |
+| `OPENAI_API_KEY` | `lm-studio` | Credential sent to the chat backend, separate from the gateway's `API_KEY` |
 | `LMSTUDIO_HOST` | `http://localhost:1234` | LM Studio API URL |
 | `LMSTUDIO_CHAT_MODEL` | `gpt-oss-120b` | Chat model name |
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
