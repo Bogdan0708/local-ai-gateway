@@ -58,13 +58,9 @@ complete API prefix, including `/v1`; it may include a reverse-proxy prefix.
 An explicit request model overrides `OPENAI_CHAT_MODEL`. When unset, the
 generic model setting retains the legacy `LMSTUDIO_CHAT_MODEL` fallback.
 
-This configures chat routing only. It does not launch the backend or disable
-server-side speculation. On this Strix Halo WSL machine, MTP/DFlash are excluded
-following repeated host crashes; see the
-[September 28 incident and benchmark record](docs/wsl-stability-2026-09-28.md).
-Use `use_rag: false` for chat without retrieval until a separate embedding
-workflow has been configured and verified. This change does not add tool-call
-forwarding, a ComfyUI queue, or model lifecycle management.
+This configures chat routing only. The gateway does not launch the backend,
+manage its model lifecycle, or change its decoding mode (for example
+speculative decoding); configure those on the backend itself.
 
 ### 3. Start the Server
 
