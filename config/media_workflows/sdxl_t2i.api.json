@@ -8,7 +8,7 @@
   "6": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "a stone bridge over a misty river at sunrise, detailed, photographic",
+      "text": "",
       "clip": [
         "4",
         1
@@ -18,7 +18,7 @@
   "7": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "blurry, low quality",
+      "text": "",
       "clip": [
         "4",
         1

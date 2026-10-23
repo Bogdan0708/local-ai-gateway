@@ -109,7 +109,7 @@ The gateway submits saved ComfyUI workflows (`config/media_workflows/<name>.api.
 plus a `<name>.params.json` whitelist of settable inputs) to a ComfyUI server and
 stores the results. Callers can only set the parameters a workflow declares;
 text is placed into node inputs and never changes the graph. One job runs at a
-time, in order. All `/v1/media` endpoints require authentication.
+time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; output files stay on disk. All `/v1/media` endpoints require authentication.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

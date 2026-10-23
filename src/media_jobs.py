@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 2.0
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_RETAINED_JOBS = 500  # finished jobs kept in memory
+PARAM_TYPES = {"integer", "string"}
 
 WORKFLOW_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -71,7 +73,7 @@ def _now() -> str:
 
 
 def _job_dir(root: Path, job_id: str, create: bool) -> Path:
-    if not JOB_ID_RE.match(job_id):
+    if not JOB_ID_RE.fullmatch(job_id):
         raise UnsafeOutputPath("invalid job id")
     root = Path(root)
     if create:
@@ -97,17 +99,24 @@ def write_output(root: Path, job_id: str, index: int, ext: str, data: bytes) -> 
     if ext not in CONTENT_TYPES:
         raise UnsafeOutputPath(f"extension {ext!r} not allowed")
     job_dir = _job_dir(root, job_id, create=True)
-    target = job_dir / f"{int(index)}.{ext}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    name = f"{int(index)}.{ext}"
     try:
-        fd = os.open(target, flags, 0o600)
+        dir_fd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
-        if exc.errno in (errno.EEXIST, errno.ELOOP):
-            raise UnsafeOutputPath("output target already exists or is a symlink") from exc
-        raise
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-    return target
+        raise UnsafeOutputPath("job directory is a symlink or unusable") from exc
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ELOOP):
+                raise UnsafeOutputPath("output target already exists or is a symlink") from exc
+            raise
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    finally:
+        os.close(dir_fd)
+    return job_dir / name
 
 
 def locate_output(root: Path, job_id: str, index: int, ext: str) -> Path:
@@ -144,7 +153,7 @@ def _read_json(path: Path) -> Any:
 
 def load_workflow(settings: Settings, name: str) -> tuple[dict, dict]:
     """Return (api graph, params spec) for a workflow, or raise WorkflowError."""
-    if not isinstance(name, str) or not WORKFLOW_NAME_RE.match(name):
+    if not isinstance(name, str) or not WORKFLOW_NAME_RE.fullmatch(name):
         raise WorkflowError("workflow name must match ^[a-z0-9_]+$")
     base = workflows_dir(settings)
     graph = _read_json(base / f"{name}.api.json")
@@ -152,7 +161,18 @@ def load_workflow(settings: Settings, name: str) -> tuple[dict, dict]:
     if not isinstance(graph, dict) or not isinstance(spec, dict):
         raise WorkflowError("malformed workflow files")
     for pname, pspec in spec.items():
-        for target in pspec.get("targets", []):
+        if not isinstance(pspec, dict) or pspec.get("type") not in PARAM_TYPES:
+            raise WorkflowError(f"param {pname!r} is malformed")
+        targets = pspec.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise WorkflowError(f"param {pname!r} needs a non-empty targets list")
+        for target in targets:
+            if not (
+                isinstance(target, list)
+                and len(target) == 2
+                and all(isinstance(t, str) for t in target)
+            ):
+                raise WorkflowError(f"param {pname!r} has a malformed target")
             node_id, input_name = target
             node = graph.get(node_id)
             if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict) or input_name not in node["inputs"]:
@@ -167,7 +187,7 @@ def list_workflows(settings: Settings) -> list[dict]:
         return found
     for path in sorted(base.glob("*.api.json")):
         name = path.name[: -len(".api.json")]
-        if not WORKFLOW_NAME_RE.match(name):
+        if not WORKFLOW_NAME_RE.fullmatch(name):
             continue
         try:
             _, spec = load_workflow(settings, name)
@@ -311,7 +331,13 @@ class MediaJobManager:
     def queued_count(self) -> int:
         return sum(1 for j in self.jobs.values() if j.status == QUEUED)
 
+    def _prune(self) -> None:
+        finished = [j for j in self.jobs.values() if j.status in FINISHED]  # insertion order
+        for old in finished[: max(0, len(finished) - MAX_RETAINED_JOBS)]:
+            del self.jobs[old.id]
+
     def enqueue(self, job: Job) -> None:
+        self._prune()
         self.jobs[job.id] = job
         self._queue.put_nowait(job.id)
 
@@ -327,7 +353,12 @@ class MediaJobManager:
         except ComfyUIError as exc:
             logger.warning("ComfyUI queue removal failed: %s", exc)
         try:
-            await self._client.interrupt()
+            running = (await self._client.queue()).get("queue_running") or []
+            ours = any(
+                isinstance(e, list) and len(e) > 1 and e[1] == prompt_id for e in running
+            )
+            if ours:
+                await self._client.interrupt(prompt_id)
         except ComfyUIError as exc:
             logger.warning("ComfyUI interrupt failed: %s", exc)
 
@@ -345,6 +376,7 @@ class MediaJobManager:
                 raise
             except ComfyUIError as exc:
                 job.finish(FAILED, str(exc))
+                await self._discard_remote(job)
             except UnsafeOutputPath as exc:
                 logger.error("Refused unsafe output for job %s: %s", job.id, exc)
                 job.finish(FAILED, f"refused to write output: {exc}")
@@ -352,9 +384,14 @@ class MediaJobManager:
                 logger.exception("Media job %s crashed", job.id)
                 job.finish(FAILED, "internal error")
 
+    async def _discard_remote(self, job: Job) -> None:
+        if job.prompt_id:
+            await self._cancel_in_comfy(job.prompt_id)
+
     async def _run(self, job: Job) -> None:
         settings, client = self.settings, self._client
         job.prompt_id = await client.submit(job.graph)
+        job.graph = {}  # no longer needed; keeps the job store small
         if job.status == CANCELLED:  # cancelled while submitting
             await self._cancel_in_comfy(job.prompt_id)
             return
@@ -369,10 +406,7 @@ class MediaJobManager:
                 if status.get("completed") or status.get("status_str") in ("success", "error"):
                     break
             if time.monotonic() >= deadline:
-                try:
-                    await client.interrupt()
-                except ComfyUIError as exc:
-                    logger.warning("ComfyUI interrupt failed: %s", exc)
+                await self._cancel_in_comfy(job.prompt_id)
                 job.finish(FAILED, f"timed out after {settings.media_job_timeout_s} s")
                 return
             await asyncio.sleep(POLL_INTERVAL_S)
@@ -392,6 +426,8 @@ class MediaJobManager:
             return
         outputs = []
         for index, img in enumerate(images):
+            if job.status == CANCELLED:
+                return
             ext = str(img.get("filename", "")).rsplit(".", 1)[-1].lower() if "." in str(img.get("filename", "")) else ""
             if ext not in CONTENT_TYPES:
                 job.finish(FAILED, "workflow produced an unsupported output type")

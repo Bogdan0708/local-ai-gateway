@@ -23,9 +23,11 @@ class FakeComfy:
     def __init__(self):
         self.submitted = []
         self.interrupts = 0
+        self.interrupt_bodies = []
         self.deleted = []
         self.mode = "success"  # success | error | hang | reject
         self.history_calls = 0
+        self.running = "auto"  # prompt id ComfyUI reports as running; "auto" = ours
         self.images = [{"filename": "ComfyUI_00001_.png", "subfolder": "", "type": "output"}]
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -42,6 +44,8 @@ class FakeComfy:
         if path.startswith("/history/"):
             self.history_calls += 1
             pid = path.rsplit("/", 1)[1]
+            if self.mode == "boom":
+                return httpx.Response(500, text="boom")
             if self.mode == "hang":
                 return httpx.Response(200, json={})
             if self.mode == "error":
@@ -56,7 +60,14 @@ class FakeComfy:
             return httpx.Response(200, content=PNG)
         if path == "/interrupt":
             self.interrupts += 1
+            self.interrupt_bodies.append(json.loads(request.content) if request.content else None)
             return httpx.Response(200)
+        if path == "/queue" and request.method == "GET":
+            running = f"pid-{len(self.submitted)}" if self.running == "auto" else self.running
+            return httpx.Response(200, json={
+                "queue_running": [[0, running, {}]] if running else [],
+                "queue_pending": [[1, f"pid-{len(self.submitted)}", {}]],
+            })
         if path == "/queue":
             self.deleted.append(json.loads(request.content))
             return httpx.Response(200)
@@ -229,6 +240,7 @@ def test_cancel_running_interrupts(client, comfy):
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
     assert comfy.interrupts == 1
+    assert comfy.interrupt_bodies == [{"prompt_id": "pid-1"}]
     time.sleep(0.2)  # the worker must not resurrect or fail a cancelled job
     assert client.get(f"/v1/media/jobs/{job_id}", headers=HEADERS).json()["status"] == "cancelled"
 
@@ -328,3 +340,117 @@ def test_client_surfaces_validation_errors():
         asyncio.run(run())
     assert "Prompt outputs failed validation" in str(err.value)
     assert "Value not in list" in str(err.value)
+
+
+def test_timeout_does_not_interrupt_other_clients_work(comfy, settings_env, tmp_path):
+    comfy.mode = "hang"
+    comfy.running = "someone-elses-prompt"
+    settings_env(MEDIA_OUTPUT_DIR=tmp_path / "media", MEDIA_JOB_TIMEOUT_S=1, ALLOW_LOOPBACK_UNAUTHENTICATED="false")
+    with TestClient(app, client=("203.0.113.7", 1234)) as client:
+        job = wait_for(client, submit(client).json()["id"], {"succeeded", "failed"}, timeout=10)
+    assert job["status"] == "failed"
+    assert comfy.deleted == [{"delete": ["pid-1"]}]
+    assert comfy.interrupts == 0
+
+
+def test_timeout_of_running_prompt_interrupts_once(comfy, settings_env, tmp_path):
+    comfy.mode = "hang"
+    settings_env(MEDIA_OUTPUT_DIR=tmp_path / "media", MEDIA_JOB_TIMEOUT_S=1, ALLOW_LOOPBACK_UNAUTHENTICATED="false")
+    with TestClient(app, client=("203.0.113.7", 1234)) as client:
+        wait_for(client, submit(client).json()["id"], {"failed"}, timeout=10)
+    assert comfy.interrupts == 1
+    assert comfy.interrupt_bodies == [{"prompt_id": "pid-1"}]
+
+
+def test_cancel_does_not_interrupt_other_clients_work(client, comfy):
+    comfy.mode = "hang"
+    comfy.running = "someone-elses-prompt"
+    job_id = submit(client).json()["id"]
+    wait_for(client, job_id, {"running"})
+    time.sleep(0.1)
+    assert client.delete(f"/v1/media/jobs/{job_id}", headers=HEADERS).status_code == 200
+    assert comfy.deleted == [{"delete": ["pid-1"]}]
+    assert comfy.interrupts == 0
+
+
+def test_failed_job_is_removed_from_comfyui(client, comfy):
+    comfy.mode = "boom"
+    job = wait_for(client, submit(client).json()["id"], {"failed", "succeeded"})
+    assert job["status"] == "failed"
+    assert comfy.deleted == [{"delete": ["pid-1"]}]
+
+
+@pytest.mark.parametrize("name", ["sdxl_t2i\n", "sdxl_t2i\n\n"])
+def test_trailing_newline_in_workflow_name_rejected(client, name):
+    response = client.post("/v1/media/jobs", json={"workflow": name, "params": {"prompt": "x"}}, headers=HEADERS)
+    assert response.status_code == 422
+
+
+def test_malformed_params_file_is_reported_not_crashing(client, comfy, settings_env, tmp_path):
+    import shutil
+    wf = tmp_path / "wf"
+    shutil.copytree(media_jobs.REPO_ROOT / "config/media_workflows", wf)
+    (wf / "broken_t2i.api.json").write_text(json.dumps({"1": {"class_type": "X", "inputs": {"a": 1}}}))
+    (wf / "broken_t2i.params.json").write_text(json.dumps({"p": {"type": "integer", "targets": "1.a"}}))
+    (wf / "broken2_t2i.api.json").write_text(json.dumps({"1": {"class_type": "X", "inputs": {"a": 1}}}))
+    (wf / "broken2_t2i.params.json").write_text(json.dumps({"p": "nope"}))
+    settings_env(MEDIA_WORKFLOWS_DIR=wf, MEDIA_OUTPUT_DIR=tmp_path / "media", ALLOW_LOOPBACK_UNAUTHENTICATED="false")
+    with TestClient(app, client=("203.0.113.7", 1234)) as c:
+        listing = c.get("/v1/media/workflows", headers=HEADERS)
+        assert listing.status_code == 200
+        names = {w["name"] for w in listing.json()["workflows"]}
+        assert "sdxl_t2i" in names and not names & {"broken_t2i", "broken2_t2i"}
+        for bad in ("broken_t2i", "broken2_t2i"):
+            r = c.post("/v1/media/jobs", json={"workflow": bad, "params": {"p": 1}}, headers=HEADERS)
+            assert r.status_code == 422
+
+
+def test_cancel_during_download_stops_writing(client, comfy):
+    comfy.images = [
+        {"filename": f"img{i}.png", "subfolder": "", "type": "output"} for i in range(3)
+    ]
+    original = media_jobs.write_output
+    holder = {}
+
+    def cancelling_write(*args, **kwargs):
+        result = original(*args, **kwargs)
+        job = media_jobs.manager.jobs[args[1]]
+        job.status = media_jobs.CANCELLED  # cancelled mid-download
+        holder["job"] = job
+        return result
+
+    import pytest as _p
+    mp = _p.MonkeyPatch()
+    mp.setattr(media_jobs, "write_output", cancelling_write)
+    try:
+        job_id = submit(client).json()["id"]
+        wait_for(client, job_id, {"cancelled"})
+        time.sleep(0.2)
+    finally:
+        mp.undo()
+    files = [p for p in comfy.out.rglob("*") if p.is_file()]
+    assert len(files) == 1
+
+
+def test_finished_jobs_are_pruned(client, comfy, monkeypatch):
+    monkeypatch.setattr(media_jobs, "MAX_RETAINED_JOBS", 3)
+    monkeypatch.setattr(media_jobs, "POLL_INTERVAL_S", 0.01)
+    comfy_ids = []
+    for _ in range(6):
+        job_id = submit(client).json()["id"]
+        comfy_ids.append(job_id)
+        wait_for(client, job_id, {"succeeded", "failed"})
+    assert len(media_jobs.manager.jobs) <= 4  # cap + the job being enqueued
+    assert client.get(f"/v1/media/jobs/{comfy_ids[0]}", headers=HEADERS).status_code == 404
+    assert client.get(f"/v1/media/jobs/{comfy_ids[-1]}", headers=HEADERS).status_code == 200
+
+
+def test_graph_is_dropped_after_submit(client, comfy):
+    job_id = submit(client).json()["id"]
+    wait_for(client, job_id, {"succeeded"})
+    assert media_jobs.manager.jobs[job_id].graph == {}
+
+
+def test_sdxl_template_prompts_are_blank():
+    graph = json.loads((media_jobs.REPO_ROOT / "config/media_workflows/sdxl_t2i.api.json").read_text())
+    assert graph["6"]["inputs"]["text"] == "" and graph["7"]["inputs"]["text"] == ""

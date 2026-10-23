@@ -84,8 +84,17 @@ class ComfyUIClient:
         )
         return response.content
 
-    async def interrupt(self) -> None:
-        await self._request("POST", "/interrupt")
+    async def interrupt(self, prompt_id: str) -> None:
+        """Interrupt only if `prompt_id` is the prompt ComfyUI is running right now."""
+        await self._request("POST", "/interrupt", json={"prompt_id": prompt_id})
+
+    async def queue(self) -> dict:
+        response = await self._request("GET", "/queue")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ComfyUIError("ComfyUI returned a malformed queue") from exc
+        return body if isinstance(body, dict) else {}
 
     async def delete_queued(self, prompt_id: str) -> None:
         await self._request("POST", "/queue", json={"delete": [prompt_id]})
