@@ -6,7 +6,7 @@ Loads configuration from environment variables and .env file.
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import Field, field_validator
@@ -33,8 +33,8 @@ class Settings(BaseSettings):
 
     # LM Studio (OpenAI-compatible)
     lmstudio_host: str = Field(default="http://localhost:1234")
-    lmstudio_chat_model: str = Field(default="gpt-oss-120b")
-    lmstudio_embed_model: str = Field(default="nomic-embed-text")
+    lmstudio_chat_model: str = Field(default="qwen/qwen3.6-35b-a3b")
+    lmstudio_embed_model: str = Field(default="text-embedding-nomic-embed-text-v1.5")
 
     # Ollama
     ollama_host: str = Field(default="http://localhost:11434")
@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="http://localhost:1234/v1")
     openai_api_key: str = Field(default="lm-studio")
     openai_chat_model: Optional[str] = Field(default=None)
+
+    # Sent as `reasoning_effort` on OpenAI-compatible chat requests when set. Thinking models
+    # (e.g. qwen3.6) reason by default; "none" cut a trivial answer from 225 to 4 tokens.
+    llm_reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(default=None)
 
     @property
     def active_chat_base_url(self) -> str:

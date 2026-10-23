@@ -35,7 +35,8 @@ Edit `.env` to match your setup:
 # For LM Studio (default)
 LLM_PROVIDER=lmstudio
 LMSTUDIO_HOST=http://localhost:1234
-LMSTUDIO_CHAT_MODEL=gpt-oss-120b
+LMSTUDIO_CHAT_MODEL=qwen/qwen3.6-35b-a3b
+LLM_REASONING_EFFORT=none  # optional: skip hidden reasoning on thinking models
 
 # Or for Ollama
 LLM_PROVIDER=ollama
@@ -262,7 +263,9 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 | `OPENAI_CHAT_MODEL` | (unset) | Generic chat model alias; falls back to `LMSTUDIO_CHAT_MODEL` |
 | `OPENAI_API_KEY` | `lm-studio` | Credential sent to the chat backend, separate from the gateway's `API_KEY` |
 | `LMSTUDIO_HOST` | `http://localhost:1234` | LM Studio API URL |
-| `LMSTUDIO_CHAT_MODEL` | `gpt-oss-120b` | Chat model name |
+| `LMSTUDIO_CHAT_MODEL` | `qwen/qwen3.6-35b-a3b` | Chat model name |
+| `LMSTUDIO_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding model name |
+| `LLM_REASONING_EFFORT` | (unset) | `reasoning_effort` sent with chat requests: none, low, medium, high |
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
 | `API_KEY` | (required) | API key for authentication (`X-API-Key` or `Authorization: Bearer`) |
 | `ALLOW_LOOPBACK_UNAUTHENTICATED` | `false` | Allow unauthenticated calls to the internal endpoints from 127.0.0.1/::1 only. Ignored (with a warning) unless `HOST` binds loopback. |

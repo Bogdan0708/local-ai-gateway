@@ -151,7 +151,8 @@ class ChatResponse(BaseModel):
 class EmbeddingRequest(BaseModel):
     """Embedding request."""
 
-    model: str = Field(default="nomic-embed-text")
+    # Accepted for OpenAI compatibility but ignored: the store must embed with one model.
+    model: str = Field(default_factory=lambda: get_settings().active_embed_model)
     input: str | list[str]
 
 
@@ -263,6 +264,12 @@ class HealthResponse(BaseModel):
 # === Helper Functions ===
 
 
+def _reasoning_fields(settings) -> dict:
+    """Optional `reasoning_effort` for OpenAI-compatible chat payloads; omitted when unset."""
+    effort = settings.llm_reasoning_effort
+    return {"reasoning_effort": effort} if effort else {}
+
+
 async def call_llm(
     messages: list[dict],
     model: str,
@@ -304,6 +311,7 @@ async def call_llm(
                     "messages": messages,
                     "temperature": temperature,
                     **({"max_tokens": max_tokens} if max_tokens else {}),
+                    **_reasoning_fields(settings),
                 },
                 headers={"Authorization": f"Bearer {settings.openai_api_key}"},
             )
@@ -423,6 +431,7 @@ async def _stream_openai_compatible(
                 "temperature": temperature,
                 "stream": True,
                 **({} if max_tokens is None else {"max_tokens": max_tokens}),
+                **_reasoning_fields(settings),
             },
             headers={"Authorization": f"Bearer {settings.openai_api_key}"},
         ) as response:
@@ -589,7 +598,7 @@ async def create_embeddings(
         data=[
             EmbeddingData(embedding=emb, index=i) for i, emb in enumerate(embeddings)
         ],
-        model=embed_request.model,
+        model=get_settings().active_embed_model,
         usage={"prompt_tokens": sum(len(t.split()) for t in inputs), "total_tokens": 0},
     )
 

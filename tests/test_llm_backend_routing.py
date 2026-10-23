@@ -150,3 +150,63 @@ def test_omitted_request_model_uses_configured_alias(settings_env, capture_backe
     assert len(requests) == 1
     assert str(requests[0].url) == "http://llama.invalid:8080/v1/chat/completions"
     assert json.loads(requests[0].content)["model"] == "qwen-local"
+
+
+def _bare_settings(**overrides):
+    return Settings(
+        _env_file=None,
+        jwt_secret="synthetic-jwt-secret-000000000000000000",
+        api_key="synthetic-api-secret-000000000000000000",
+        **overrides,
+    )
+
+
+def test_lmstudio_defaults_match_the_shared_hub():
+    settings = _bare_settings()
+    assert settings.lmstudio_chat_model == "qwen/qwen3.6-35b-a3b"
+    assert settings.lmstudio_embed_model == "text-embedding-nomic-embed-text-v1.5"
+    assert settings.llm_reasoning_effort is None
+
+
+def test_reasoning_effort_rejects_unknown_values():
+    with pytest.raises(ValueError):
+        _bare_settings(llm_reasoning_effort="maximum")
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("effort", [None, "none", "high"])
+def test_reasoning_effort_is_sent_only_when_configured(
+    settings_env, capture_backend, streaming, effort,
+):
+    settings_env(LLM_PROVIDER="lmstudio", LMSTUDIO_HOST="http://studio.invalid:1234",
+                 **({"LLM_REASONING_EFFORT": effort} if effort else {}))
+    requests = capture_backend()
+
+    async def invoke():
+        if streaming:
+            return [chunk async for chunk in stream_llm_response([], "")]
+        return await call_llm([], "")
+
+    asyncio.run(invoke())
+    payload = json.loads(requests[0].content)
+    if effort is None:
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == effort
+
+
+def test_embeddings_response_reports_the_model_actually_used(settings_env):
+    from unittest.mock import MagicMock, patch
+
+    settings = settings_env(LLM_PROVIDER="lmstudio", LMSTUDIO_EMBED_MODEL="hub-embedder")
+    memory = MagicMock()
+    memory._embeddings.embed_batch.return_value = [[0.1, 0.2], [0.3, 0.4]]
+    with patch("src.api_gateway.get_memory", return_value=memory), TestClient(app) as client:
+        response = client.post(
+            "/v1/embeddings",
+            headers={"X-API-Key": settings.api_key},
+            json={"model": "client-asked-for-this", "input": ["a", "b"]},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "hub-embedder"
+    memory._embeddings.embed_batch.assert_called_once_with(["a", "b"])

@@ -49,8 +49,9 @@ ENCRYPTION_KEY={encryption_key}
 # === LLM Configuration ===
 LLM_PROVIDER=lmstudio
 LMSTUDIO_HOST=http://localhost:1234
-LMSTUDIO_CHAT_MODEL=gpt-oss-120b
-LMSTUDIO_EMBED_MODEL=nomic-embed-text
+LMSTUDIO_CHAT_MODEL=qwen/qwen3.6-35b-a3b
+LMSTUDIO_EMBED_MODEL=text-embedding-nomic-embed-text-v1.5
+LLM_REASONING_EFFORT=none
 
 # === Server Configuration ===
 HOST=0.0.0.0
