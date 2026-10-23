@@ -26,6 +26,11 @@ for _key, _value in _DEFAULT_ENV.items():
 
 TEST_API_KEY = os.environ["API_KEY"]
 
+# A developer's real .env (created by `run.py --setup`) must not leak into tests.
+from src.config import Settings  # noqa: E402
+
+Settings.model_config["env_file"] = None
+
 
 @pytest.fixture
 def settings_env(monkeypatch):

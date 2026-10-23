@@ -685,23 +685,26 @@ async def upload_file(
     """Upload and index a file."""
     settings = get_settings()
 
-    # Save uploaded file temporarily
-    import tempfile
+    # Only the final path component of the client's name is kept, so it cannot steer the write.
+    safe_name = Path(file.filename or "").name
+    if safe_name in ("", ".", ".."):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing filename")
 
-    with tempfile.NamedTemporaryFile(
-        delete=False, suffix=Path(file.filename).suffix
-    ) as tmp:
-        content = await file.read()
+    content = await file.read()
+    if len(content) > settings.max_file_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large. Max: {settings.max_file_size_mb}MB",
+        )
 
-        # Check size
-        if len(content) > settings.max_file_size_bytes:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File too large. Max: {settings.max_file_size_mb}MB",
-            )
+    # Stage inside the documents dir: ingest_file only accepts paths under the configured
+    # documents/code dirs, and the original name becomes the indexed source.
+    import uuid
 
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
+    staging_dir = settings.documents_path / "uploads" / uuid.uuid4().hex
+    staging_dir.mkdir(parents=True)
+    tmp_path = staging_dir / safe_name
+    tmp_path.write_bytes(content)
 
     try:
         service = FileIngestionService()
@@ -721,6 +724,7 @@ async def upload_file(
         )
     finally:
         tmp_path.unlink(missing_ok=True)
+        staging_dir.rmdir()
 
 
 @app.post(
