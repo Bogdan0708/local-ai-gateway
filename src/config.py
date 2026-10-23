@@ -142,6 +142,16 @@ class Settings(BaseSettings):
     web_fetch_max_size_mb: int = Field(default=5)
     web_fetch_rate_limit: int = Field(default=10, description="Requests per minute")
 
+    # === Media (ComfyUI image jobs) ===
+    comfyui_host: str = Field(default="http://127.0.0.1:8188")
+    media_workflows_dir: Path = Field(
+        default=Path("config/media_workflows"),
+        description="Saved ComfyUI workflows; a relative path is resolved against the repo",
+    )
+    media_output_dir: Path = Field(default=Path("/data/media"))
+    media_job_timeout_s: int = Field(default=900, ge=1)
+    media_max_queued_jobs: int = Field(default=8, ge=1)
+
     # === ChromaDB ===
     chroma_persist_dir: Path = Field(default=Path("/data/chroma"))
     chroma_collection_name: str = Field(default="local_ai_knowledge")

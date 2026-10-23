@@ -98,6 +98,26 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `/v1/files` | POST | Upload and index a file |
 | `/v1/web/fetch` | POST | Fetch web content |
 | `/v1/web/index` | POST | Fetch and index web content |
+| `/v1/media/workflows` | GET | List image workflows and their allowed parameters |
+| `/v1/media/jobs` | POST | Queue an image job (`{"workflow", "params"}`), returns 202 |
+| `/v1/media/jobs/{id}` | GET / DELETE | Job status / cancel (409 once finished) |
+| `/v1/media/jobs/{id}/outputs/{index}` | GET | Download a generated image |
+
+## Image Jobs (ComfyUI)
+
+The gateway submits saved ComfyUI workflows (`config/media_workflows/<name>.api.json`
+plus a `<name>.params.json` whitelist of settable inputs) to a ComfyUI server and
+stores the results. Callers can only set the parameters a workflow declares;
+text is placed into node inputs and never changes the graph. One job runs at a
+time, in order. All `/v1/media` endpoints require authentication.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `COMFYUI_HOST` | `http://127.0.0.1:8188` | ComfyUI server URL |
+| `MEDIA_WORKFLOWS_DIR` | `config/media_workflows` | Workflow templates (relative to the repo) |
+| `MEDIA_OUTPUT_DIR` | `/data/media` | Images are written to `<dir>/<job_id>/<index>.<ext>` |
+| `MEDIA_JOB_TIMEOUT_S` | `900` | A running job is interrupted and failed after this long |
+| `MEDIA_MAX_QUEUED_JOBS` | `8` | Further submissions get HTTP 429 |
 
 ## Ingesting Documents
 

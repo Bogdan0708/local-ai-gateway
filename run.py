@@ -57,6 +57,10 @@ LLM_REASONING_EFFORT=none
 HOST=0.0.0.0
 PORT=8000
 DEBUG=false
+
+# === Media (ComfyUI image jobs) ===
+COMFYUI_HOST=http://127.0.0.1:8188
+MEDIA_OUTPUT_DIR=/data/media
 """
 
     # Replace placeholder values

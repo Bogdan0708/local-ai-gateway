@@ -38,6 +38,7 @@ from .file_service import (
 )
 from .memory import Document, get_memory
 from .web_fetcher import FetchError, SecurityError, fetch_url, perform_search
+from .media_jobs import router as media_router, start_worker, stop_worker
 from .mcp_bridge import (  # MCP bridge for PAI integration
     health_router as mcp_health_router,
     router as mcp_router,
@@ -64,7 +65,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             settings.host,
         )
 
-    yield
+    await start_worker()
+    try:
+        yield
+    finally:
+        await stop_worker()
 
     logger.info("Shutting down Secure Local AI API Gateway")
 
@@ -97,6 +102,7 @@ app.add_middleware(
 # Include MCP bridge routers for PAI integration
 app.include_router(mcp_router)
 app.include_router(mcp_health_router)
+app.include_router(media_router)
 
 # === Request/Response Models ===
 

@@ -50,6 +50,16 @@ def test_web_search_route_survives_assembly():
     assert "/v1/web/search" in PATHS
 
 
+def test_media_routes_are_mounted():
+    for path in (
+        "/v1/media/workflows",
+        "/v1/media/jobs",
+        "/v1/media/jobs/{job_id}",
+        "/v1/media/jobs/{job_id}/outputs/{index}",
+    ):
+        assert path in PATHS
+
+
 def test_core_routes_are_still_present():
     for path in ("/health", "/api/chat", "/api/read-file", "/v1/chat/completions"):
         assert path in PATHS
