@@ -348,6 +348,19 @@ pip install -r requirements.txt
 pytest -q
 ```
 
+The dependency minimums include PDF parser security fixes and removal of the
+compromised emSign certificate chain. Update an existing environment explicitly:
+
+```bash
+python -m pip install --upgrade 'certifi>=2026.10.19' 'pypdf>=6.21.2'
+python -m pip check
+python -m pytest -q
+```
+
+Restart any running gateway process after updating its environment. The security
+tests check the default outbound TLS trust store and reject a malformed PDF in a
+subprocess with a timeout, so a vulnerable parser cannot hang the test runner.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
