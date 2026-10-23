@@ -10,7 +10,7 @@ Implements:
 
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -120,7 +120,7 @@ class AuthManager:
         expires_delta: Optional[timedelta] = None,
     ) -> str:
         """Create a new JWT access token."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expire = now + (
             expires_delta or timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
         )
@@ -137,7 +137,7 @@ class AuthManager:
 
     def create_refresh_token(self, subject: str) -> str:
         """Create a new JWT refresh token."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expire = now + timedelta(days=self.REFRESH_TOKEN_EXPIRE_DAYS)
 
         payload = {
@@ -308,8 +308,8 @@ async def require_auth(
             # Create a pseudo-token for API key auth
             return TokenData(
                 sub="api_key_user",
-                exp=datetime.utcnow() + timedelta(hours=1),
-                iat=datetime.utcnow(),
+                exp=datetime.now(timezone.utc) + timedelta(hours=1),
+                iat=datetime.now(timezone.utc),
                 type="api_key",
                 scopes=["*"],  # API key has full access
             )
@@ -325,8 +325,8 @@ async def require_auth(
         if auth_manager.verify_api_key(bearer_token):
             return TokenData(
                 sub="api_key_user",
-                exp=datetime.utcnow() + timedelta(hours=1),
-                iat=datetime.utcnow(),
+                exp=datetime.now(timezone.utc) + timedelta(hours=1),
+                iat=datetime.now(timezone.utc),
                 type="api_key",
                 scopes=["*"],
             )
@@ -391,8 +391,8 @@ async def require_local_or_auth(
         if client_host in LOOPBACK_HOSTS:
             return TokenData(
                 sub="local_user",
-                exp=datetime.utcnow() + timedelta(hours=1),
-                iat=datetime.utcnow(),
+                exp=datetime.now(timezone.utc) + timedelta(hours=1),
+                iat=datetime.now(timezone.utc),
                 type="local",
                 scopes=["*"],
             )

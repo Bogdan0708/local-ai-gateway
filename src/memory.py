@@ -11,7 +11,7 @@ Implements:
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -485,7 +485,7 @@ class HybridMemory:
             "total_documents": self._collection.count(),
             "collection_name": self.collection_name,
             "persist_dir": str(self.persist_dir),
-            "last_updated": datetime.utcnow().isoformat(),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
     def close(self):

@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
@@ -386,9 +386,9 @@ async def _stream_ollama(
                     if content:
                         # Convert to OpenAI format
                         chunk = {
-                            "id": f"chatcmpl-{datetime.utcnow().timestamp()}",
+                            "id": f"chatcmpl-{datetime.now(timezone.utc).timestamp()}",
                             "object": "chat.completion.chunk",
-                            "created": int(datetime.utcnow().timestamp()),
+                            "created": int(datetime.now(timezone.utc).timestamp()),
                             "model": model,
                             "choices": [{
                                 "index": 0,
@@ -402,9 +402,9 @@ async def _stream_ollama(
                     if data.get("done", False):
                         # Final chunk with finish_reason
                         final_chunk = {
-                            "id": f"chatcmpl-{datetime.utcnow().timestamp()}",
+                            "id": f"chatcmpl-{datetime.now(timezone.utc).timestamp()}",
                             "object": "chat.completion.chunk",
-                            "created": int(datetime.utcnow().timestamp()),
+                            "created": int(datetime.now(timezone.utc).timestamp()),
                             "model": model,
                             "choices": [{
                                 "index": 0,
@@ -467,7 +467,7 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         version="0.1.0",
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         llm_provider=settings.llm_provider,
         llm_model=settings.active_chat_model,
         memory_documents=memory._collection.count(),
@@ -565,8 +565,8 @@ async def chat_completions(
         )
 
     return ChatResponse(
-        id=f"chatcmpl-{datetime.utcnow().timestamp()}",
-        created=int(datetime.utcnow().timestamp()),
+        id=f"chatcmpl-{datetime.now(timezone.utc).timestamp()}",
+        created=int(datetime.now(timezone.utc).timestamp()),
         model=chat_request.model,
         choices=[
             ChatChoice(
@@ -1250,9 +1250,9 @@ async def internal_chat(
 
     # Return response with RAG sources
     response_data = {
-        "id": f"chatcmpl-{datetime.utcnow().timestamp()}",
+        "id": f"chatcmpl-{datetime.now(timezone.utc).timestamp()}",
         "object": "chat.completion",
-        "created": int(datetime.utcnow().timestamp()),
+        "created": int(datetime.now(timezone.utc).timestamp()),
         "model": chat_request.model,
         "choices": [
             {

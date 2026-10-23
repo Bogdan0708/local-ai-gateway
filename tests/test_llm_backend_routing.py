@@ -210,3 +210,26 @@ def test_embeddings_response_reports_the_model_actually_used(settings_env):
     assert response.status_code == 200, response.text
     assert response.json()["model"] == "hub-embedder"
     memory._embeddings.embed_batch.assert_called_once_with(["a", "b"])
+
+
+def test_chat_created_is_a_real_unix_timestamp_in_any_local_timezone(
+    settings_env, capture_backend, monkeypatch,
+):
+    import time
+
+    monkeypatch.setenv("TZ", "Asia/Tokyo")  # UTC+9: a naive utcnow().timestamp() is 9 h off
+    time.tzset()
+    try:
+        settings = settings_env(LLM_PROVIDER="lmstudio", LMSTUDIO_HOST="http://studio.invalid:1234")
+        capture_backend()
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-API-Key": settings.api_key},
+                json={"messages": [{"role": "user", "content": "hi"}], "use_rag": False},
+            )
+        assert response.status_code == 200, response.text
+        assert abs(response.json()["created"] - time.time()) < 60
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()

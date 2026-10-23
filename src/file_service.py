@@ -12,7 +12,7 @@ import fnmatch
 import hashlib
 import logging
 import mimetypes
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Optional
 
@@ -208,7 +208,7 @@ class DocumentProcessor:
             "extension": file_path.suffix.lower(),
             "size_bytes": stat.st_size,
             "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "indexed_at": datetime.utcnow().isoformat(),
+            "indexed_at": datetime.now(timezone.utc).isoformat(),
             "file_hash": file_hash,
         }
 

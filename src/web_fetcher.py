@@ -24,7 +24,7 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 import os
@@ -446,7 +446,7 @@ class ContentCache:
         key = self._make_key(url)
         if key in self._cache:
             result, timestamp = self._cache[key]
-            if datetime.utcnow() - timestamp < self.ttl:
+            if datetime.now(timezone.utc) - timestamp < self.ttl:
                 return result
             else:
                 del self._cache[key]
@@ -455,7 +455,7 @@ class ContentCache:
     def set(self, url: str, result: FetchResult) -> None:
         """Cache a result."""
         key = self._make_key(url)
-        self._cache[key] = (result, datetime.utcnow())
+        self._cache[key] = (result, datetime.now(timezone.utc))
 
     def _make_key(self, url: str) -> str:
         """Create cache key from URL."""
@@ -760,7 +760,7 @@ class WebFetcher:
             content_type=content_type,
             status_code=response.status_code,
             tier_used="httpx",
-            fetched_at=datetime.utcnow().isoformat(),
+            fetched_at=datetime.now(timezone.utc).isoformat(),
             metadata={
                 "headers": dict(response.headers),
             },
@@ -844,7 +844,7 @@ class WebFetcher:
             content_type="text/html",
             status_code=status_code,
             tier_used="curl",
-            fetched_at=datetime.utcnow().isoformat(),
+            fetched_at=datetime.now(timezone.utc).isoformat(),
             metadata={},
         )
 
@@ -945,7 +945,7 @@ class WebFetcher:
                     content_type="text/html",
                     status_code=response.status,
                     tier_used="playwright",
-                    fetched_at=datetime.utcnow().isoformat(),
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
                     metadata={},
                 )
             finally:
