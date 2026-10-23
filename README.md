@@ -109,7 +109,26 @@ The gateway submits saved ComfyUI workflows (`config/media_workflows/<name>.api.
 plus a `<name>.params.json` whitelist of settable inputs) to a ComfyUI server and
 stores the results. Callers can only set the parameters a workflow declares;
 text is placed into node inputs and never changes the graph. One job runs at a
-time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; output files stay on disk. All `/v1/media` endpoints require authentication.
+time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; successful output files stay on disk. All `/v1/media` endpoints require authentication.
+
+Media jobs require ComfyUI **0.42.1 or newer**. The gateway checks the version
+before submission and assigns the prompt UUID itself, so timeout or shutdown can
+identify its work even if the submission response has not arrived.
+
+One execution deadline covers submission checks, queue/history polling,
+downloads, and output writes. Downloads are streamed with a **64 MiB per-image
+limit**. Cancellation, timeout, and graceful shutdown stop the active operation,
+wait for any in-flight local file write to settle, and remove this job's
+incomplete images. Completed jobs keep their outputs. Queued jobs are cancelled
+without submission during shutdown.
+
+Remote cancellation uses ComfyUI's atomic `/api/jobs/{id}/cancel` endpoint,
+scoped to the job's prompt ID, with a five-second cleanup budget after the
+execution deadline. There is no fallback to the legacy interrupt endpoint.
+If ComfyUI is unreachable, the gateway logs that remote cancellation could not be confirmed. Cancellation is
+best effort: a server that accepts a submission after cleanup has finished can
+still run it. A forceful process termination cannot perform this cleanup; the job
+store is not durable.
 
 Shipped workflows (model files go in ComfyUI's `models/` folders):
 
@@ -124,7 +143,7 @@ Shipped workflows (model files go in ComfyUI's `models/` folders):
 | `COMFYUI_HOST` | `http://127.0.0.1:8188` | ComfyUI server URL |
 | `MEDIA_WORKFLOWS_DIR` | `config/media_workflows` | Workflow templates (relative to the repo) |
 | `MEDIA_OUTPUT_DIR` | `/data/media` | Images are written to `<dir>/<job_id>/<index>.<ext>` |
-| `MEDIA_JOB_TIMEOUT_S` | `900` | A running job is interrupted and failed after this long |
+| `MEDIA_JOB_TIMEOUT_S` | `900` | Total execution deadline in seconds; cancellation/file cleanup follows |
 | `MEDIA_MAX_QUEUED_JOBS` | `8` | Further submissions get HTTP 429 |
 
 ## Ingesting Documents

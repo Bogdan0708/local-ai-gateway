@@ -23,15 +23,20 @@ class FakeComfy:
     def __init__(self):
         self.submitted = []
         self.interrupts = 0
-        self.interrupt_bodies = []
-        self.deleted = []
+        self.cancelled = []
         self.mode = "success"  # success | error | hang | reject
         self.history_calls = 0
         self.running = "auto"  # prompt id ComfyUI reports as running; "auto" = ours
         self.images = [{"filename": "ComfyUI_00001_.png", "subfolder": "", "type": "output"}]
 
+    @property
+    def prompt_id(self):
+        return self.submitted[-1].get("prompt_id", f"pid-{len(self.submitted)}") if self.submitted else None
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path == "/system_stats":
+            return httpx.Response(200, json={"system": {"comfyui_version": "0.42.1"}})
         if path == "/prompt":
             if self.mode == "reject":
                 return httpx.Response(400, json={
@@ -40,7 +45,7 @@ class FakeComfy:
                 })
             body = json.loads(request.content)
             self.submitted.append(body)
-            return httpx.Response(200, json={"prompt_id": f"pid-{len(self.submitted)}"})
+            return httpx.Response(200, json={"prompt_id": self.prompt_id})
         if path.startswith("/history/"):
             self.history_calls += 1
             pid = path.rsplit("/", 1)[1]
@@ -58,19 +63,13 @@ class FakeComfy:
                 "outputs": {"9": {"images": self.images}}}})
         if path == "/view":
             return httpx.Response(200, content=PNG)
-        if path == "/interrupt":
-            self.interrupts += 1
-            self.interrupt_bodies.append(json.loads(request.content) if request.content else None)
-            return httpx.Response(200)
-        if path == "/queue" and request.method == "GET":
-            running = f"pid-{len(self.submitted)}" if self.running == "auto" else self.running
-            return httpx.Response(200, json={
-                "queue_running": [[0, running, {}]] if running else [],
-                "queue_pending": [[1, f"pid-{len(self.submitted)}", {}]],
-            })
-        if path == "/queue":
-            self.deleted.append(json.loads(request.content))
-            return httpx.Response(200)
+        if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+            pid = path.split("/")[3]
+            self.cancelled.append(pid)
+            running = self.prompt_id if self.running == "auto" else self.running
+            if pid == running:
+                self.interrupts += 1
+            return httpx.Response(200, json={"cancelled": pid == self.prompt_id})
         return httpx.Response(404)
 
 
@@ -240,7 +239,7 @@ def test_cancel_running_interrupts(client, comfy):
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
     assert comfy.interrupts == 1
-    assert comfy.interrupt_bodies == [{"prompt_id": "pid-1"}]
+    assert comfy.cancelled == [comfy.prompt_id]
     time.sleep(0.2)  # the worker must not resurrect or fail a cancelled job
     assert client.get(f"/v1/media/jobs/{job_id}", headers=HEADERS).json()["status"] == "cancelled"
 
@@ -349,7 +348,7 @@ def test_timeout_does_not_interrupt_other_clients_work(comfy, settings_env, tmp_
     with TestClient(app, client=("203.0.113.7", 1234)) as client:
         job = wait_for(client, submit(client).json()["id"], {"succeeded", "failed"}, timeout=10)
     assert job["status"] == "failed"
-    assert comfy.deleted == [{"delete": ["pid-1"]}]
+    assert comfy.cancelled == [comfy.prompt_id]
     assert comfy.interrupts == 0
 
 
@@ -359,7 +358,7 @@ def test_timeout_of_running_prompt_interrupts_once(comfy, settings_env, tmp_path
     with TestClient(app, client=("203.0.113.7", 1234)) as client:
         wait_for(client, submit(client).json()["id"], {"failed"}, timeout=10)
     assert comfy.interrupts == 1
-    assert comfy.interrupt_bodies == [{"prompt_id": "pid-1"}]
+    assert comfy.cancelled == [comfy.prompt_id]
 
 
 def test_cancel_does_not_interrupt_other_clients_work(client, comfy):
@@ -369,7 +368,7 @@ def test_cancel_does_not_interrupt_other_clients_work(client, comfy):
     wait_for(client, job_id, {"running"})
     time.sleep(0.1)
     assert client.delete(f"/v1/media/jobs/{job_id}", headers=HEADERS).status_code == 200
-    assert comfy.deleted == [{"delete": ["pid-1"]}]
+    assert comfy.cancelled == [comfy.prompt_id]
     assert comfy.interrupts == 0
 
 
@@ -377,7 +376,7 @@ def test_failed_job_is_removed_from_comfyui(client, comfy):
     comfy.mode = "boom"
     job = wait_for(client, submit(client).json()["id"], {"failed", "succeeded"})
     assert job["status"] == "failed"
-    assert comfy.deleted == [{"delete": ["pid-1"]}]
+    assert comfy.cancelled == [comfy.prompt_id]
 
 
 @pytest.mark.parametrize("name", ["sdxl_t2i\n", "sdxl_t2i\n\n"])
@@ -386,7 +385,7 @@ def test_trailing_newline_in_workflow_name_rejected(client, name):
     assert response.status_code == 422
 
 
-def test_malformed_params_file_is_reported_not_crashing(client, comfy, settings_env, tmp_path):
+def test_malformed_params_file_is_reported_not_crashing(comfy, settings_env, tmp_path):
     import shutil
     wf = tmp_path / "wf"
     shutil.copytree(media_jobs.REPO_ROOT / "config/media_workflows", wf)
@@ -415,7 +414,7 @@ def test_cancel_during_download_stops_writing(client, comfy):
     def cancelling_write(*args, **kwargs):
         result = original(*args, **kwargs)
         job = media_jobs.manager.jobs[args[1]]
-        job.status = media_jobs.CANCELLED  # cancelled mid-download
+        job.finish(media_jobs.CANCELLED)  # cancelled while the first write settles
         holder["job"] = job
         return result
 
@@ -429,7 +428,7 @@ def test_cancel_during_download_stops_writing(client, comfy):
     finally:
         mp.undo()
     files = [p for p in comfy.out.rglob("*") if p.is_file()]
-    assert len(files) == 1
+    assert files == []
 
 
 def test_finished_jobs_are_pruned(client, comfy, monkeypatch):
