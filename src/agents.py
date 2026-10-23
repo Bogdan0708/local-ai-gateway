@@ -1,20 +1,38 @@
 """
 Agent workflows using LangGraph for multi-step AI orchestration.
 
-This module provides specialized agent workflows that combine multiple
-local LLM tiers for optimal performance:
-- Fast tier (7B-30B) for quick tasks
-- Quality tier (70B-80B) for complex reasoning
-- Ultra tier (120B) for frontier-level tasks
+Agents call the configured chat backend (LM Studio, Ollama or any
+OpenAI-compatible server) and use up to three model tiers:
+- Fast tier (AGENT_FAST_MODEL) for quick tasks such as coding
+- Quality tier (AGENT_QUALITY_MODEL) for architecture and review
+- Ultra tier (AGENT_ULTRA_MODEL) for research synthesis
+Unset tiers fall back to the active chat model.
 """
 
-from typing import TypedDict, Annotated
+from typing import Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 import operator
 import logging
 
+from .config import Settings, get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _chat_model(settings: Settings, tier_model: Optional[str], temperature: float) -> ChatOpenAI:
+    """OpenAI-compatible client for one agent tier on the active backend."""
+    if settings.llm_provider == "ollama":
+        base_url = f"{settings.ollama_host.rstrip('/')}/v1"
+    else:
+        base_url = settings.active_chat_base_url
+    return ChatOpenAI(
+        model=tier_model or settings.active_chat_model,
+        base_url=base_url,
+        api_key=settings.openai_api_key,
+        temperature=temperature,
+        reasoning_effort=settings.llm_reasoning_effort,
+    )
 
 
 class AgentState(TypedDict):
@@ -36,31 +54,23 @@ class DevOpsAgent:
     3. Reviewer (quality tier) - Reviews code for quality/security
 
     Usage:
-        agent = DevOpsAgent(litellm_base="http://localhost:4000")
+        agent = DevOpsAgent()
         result = await agent.run("Create a function to validate emails")
         print(result["code"])
     """
 
-    def __init__(self, litellm_base: str = "http://localhost:4000"):
+    def __init__(self, settings: Optional[Settings] = None):
         """
-        Initialize DevOps agent with LiteLLM routing proxy.
+        Initialize DevOps agent on the configured chat backend.
 
         Args:
-            litellm_base: Base URL for LiteLLM proxy (default: http://localhost:4000)
+            settings: Settings to use (default: the application settings)
         """
-        self.fast_model = ChatOpenAI(
-            model="fast-coding",
-            base_url=f"{litellm_base}/v1",
-            api_key="dummy",  # LiteLLM doesn't require real API key for local models
-            temperature=0.2  # Low temperature for deterministic code generation
-        )
-
-        self.quality_model = ChatOpenAI(
-            model="quality-research",
-            base_url=f"{litellm_base}/v1",
-            api_key="dummy",
-            temperature=0.3  # Slightly higher for architecture/review
-        )
+        settings = settings or get_settings()
+        # Low temperature for deterministic code generation
+        self.fast_model = _chat_model(settings, settings.agent_fast_model, temperature=0.2)
+        # Slightly higher for architecture/review
+        self.quality_model = _chat_model(settings, settings.agent_quality_model, temperature=0.3)
 
         # Build workflow graph
         self.graph = StateGraph(AgentState)
@@ -75,7 +85,7 @@ class DevOpsAgent:
         self.graph.add_edge("review", END)
 
         self.workflow = self.graph.compile()
-        logger.info("DevOps agent initialized with LiteLLM routing")
+        logger.info("DevOps agent initialized on the configured chat backend")
 
     async def analyze_task(self, state: AgentState) -> AgentState:
         """
@@ -207,7 +217,7 @@ class ResearchAgent:
     """
     Research agent that synthesizes information from multiple sources.
 
-    Uses ultra tier (120B) for deep research and synthesis tasks.
+    Uses the ultra tier for deep research and synthesis tasks.
 
     Usage:
         agent = ResearchAgent()
@@ -217,14 +227,11 @@ class ResearchAgent:
         )
     """
 
-    def __init__(self, litellm_base: str = "http://localhost:4000"):
-        """Initialize research agent with ultra tier model."""
-        self.ultra_model = ChatOpenAI(
-            model="ultra-reasoning",
-            base_url=f"{litellm_base}/v1",
-            api_key="dummy",
-            temperature=0.4  # Higher temperature for creative synthesis
-        )
+    def __init__(self, settings: Optional[Settings] = None):
+        """Initialize research agent with the ultra tier model."""
+        settings = settings or get_settings()
+        # Higher temperature for creative synthesis
+        self.ultra_model = _chat_model(settings, settings.agent_ultra_model, temperature=0.4)
         logger.info("Research agent initialized with ultra tier model")
 
     async def run(self, query: str, sources: list[str]) -> dict:
@@ -272,13 +279,13 @@ class ResearchAgent:
 
 
 # Factory function for easy agent instantiation
-def create_agent(agent_type: str, litellm_base: str = "http://localhost:4000"):
+def create_agent(agent_type: str, settings: Optional[Settings] = None):
     """
     Create an agent instance by type.
 
     Args:
         agent_type: One of: "devops", "research"
-        litellm_base: Base URL for LiteLLM proxy
+        settings: Settings to use (default: the application settings)
 
     Returns:
         Agent instance
@@ -295,4 +302,4 @@ def create_agent(agent_type: str, litellm_base: str = "http://localhost:4000"):
     if agent_type not in agents:
         raise ValueError(f"Unknown agent type: {agent_type}. Available: {list(agents.keys())}")
 
-    return agents[agent_type](litellm_base=litellm_base)
+    return agents[agent_type](settings=settings)

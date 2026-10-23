@@ -881,7 +881,7 @@ async def run_devops_agent(
 
         logger.info(f"Running DevOps agent for task: {agent_request.task}")
 
-        agent = DevOpsAgent(litellm_base=get_settings().lmstudio_host)
+        agent = DevOpsAgent()
         result = await agent.run(task=agent_request.task)
 
         return AgentResponse(
@@ -914,7 +914,7 @@ async def run_research_agent(
     Run Research agent workflow.
 
     The Research agent synthesizes information from multiple sources
-    using the ultra tier model (120B) for deep analysis.
+    using the ultra tier model (AGENT_ULTRA_MODEL) for deep analysis.
 
     Example request:
     {
@@ -938,7 +938,7 @@ async def run_research_agent(
 
         logger.info(f"Running Research agent for query: {agent_request.task}")
 
-        agent = ResearchAgent(litellm_base=get_settings().lmstudio_host)
+        agent = ResearchAgent()
         result = await agent.run(
             query=agent_request.task,
             sources=sources

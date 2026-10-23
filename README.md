@@ -262,6 +262,9 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 | `LMSTUDIO_CHAT_MODEL` | `qwen/qwen3.6-35b-a3b` | Chat model name |
 | `LMSTUDIO_EMBED_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding model name |
 | `LLM_REASONING_EFFORT` | (unset) | `reasoning_effort` sent with chat requests: none, low, medium, high |
+| `AGENT_FAST_MODEL` | (chat model) | DevOps agent coder tier, on the active backend |
+| `AGENT_QUALITY_MODEL` | (chat model) | DevOps agent architect/reviewer tier |
+| `AGENT_ULTRA_MODEL` | (chat model) | Research agent synthesis tier |
 | `JWT_SECRET` | (required) | Secret for JWT tokens |
 | `API_KEY` | (required) | API key for authentication (`X-API-Key` or `Authorization: Bearer`) |
 | `ALLOW_LOOPBACK_UNAUTHENTICATED` | `false` | Allow unauthenticated calls to the internal endpoints from 127.0.0.1/::1 only. Ignored (with a warning) unless `HOST` binds loopback. |

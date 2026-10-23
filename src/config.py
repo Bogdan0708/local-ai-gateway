@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # (e.g. qwen3.6) reason by default; "none" cut a trivial answer from 225 to 4 tokens.
     llm_reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(default=None)
 
+    # Per-tier agent models on the active backend; unset tiers use the active chat model.
+    agent_fast_model: Optional[str] = Field(default=None)
+    agent_quality_model: Optional[str] = Field(default=None)
+    agent_ultra_model: Optional[str] = Field(default=None)
+
     @property
     def active_chat_base_url(self) -> str:
         """Full API prefix for an OpenAI-compatible chat backend."""

@@ -45,6 +45,3 @@ duckduckgo-search>=6.0.0
 python-dotenv>=1.0.0
 prompt-toolkit>=3.0.0
 rich>=13.7.0
-
-# === Multi-Model Routing & Agent Orchestration ===
-litellm>=1.50.0
