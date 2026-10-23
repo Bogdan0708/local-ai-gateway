@@ -196,6 +196,19 @@ resolution, resolved-IP ranges, domain policy) against the new destination
 before requesting it, and the chain is capped at 5 hops. The curl fallback
 runs without `-L` and is subject to the same loop.
 
+HTTPX and curl connect directly to the validated IP while verifying the original
+hostname and preserving its HTTP authority, including a non-default port. They
+ignore proxy environment settings so a proxy cannot resolve a different address.
+HTTPX still honors `SSL_CERT_FILE` / `SSL_CERT_DIR`, and curl still honors
+`CURL_CA_BUNDLE`. Curl ignores `.curlrc` so it cannot disable certificate checks
+or enable automatic redirects. HTTPX closes connections after each fetch to keep
+TLS identities separate when multiple hostnames share an IP.
+DNS answers retain the operating system's address preference after validation,
+so deduplication does not randomly prefer an unreachable IPv4/IPv6 address.
+DNS and TLS use the same canonical IDNA hostname. Percent-escaped or scoped
+hostnames and port zero are refused before DNS to avoid parser differences
+between transports.
+
 ### Domain Allowlist
 
 Outbound fetches are restricted to an allowlist, enforced **fail-closed**: a

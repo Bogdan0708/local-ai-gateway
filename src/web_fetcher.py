@@ -194,6 +194,19 @@ class SafeDNSResolver:
         if not hostname:
             raise SecurityError("No hostname in URL")
 
+        # HTTPX and curl disagree about percent escapes in hostnames. Refuse
+        # ambiguous authorities before DNS or either transport can interpret them.
+        if "%" in hostname:
+            raise SecurityError("Percent-encoded or scoped hostnames are not supported")
+        try:
+            origin = httpx.URL(url)
+        except (httpx.InvalidURL, ValueError, UnicodeError) as exc:
+            raise SecurityError("Invalid URL authority") from exc
+        if origin.port == 0:
+            raise SecurityError("Port zero is not allowed")
+        # Use the same IDNA form for DNS, TLS verification, and HTTP authority.
+        hostname = origin.raw_host.decode("ascii")
+
         # Check hostname blocklist
         if hostname.lower() in BLOCKED_HOSTNAMES:
             raise SecurityError(f"Blocked hostname: {hostname}")
@@ -230,8 +243,8 @@ class SafeDNSResolver:
         if not addr_infos:
             raise SecurityError(f"No DNS records found for {hostname}")
 
-        # Extract unique IPs
-        ips = list(set(info[4][0] for info in addr_infos))
+        # Deduplicate without losing the OS's reachable-address preference.
+        ips = list(dict.fromkeys(info[4][0] for info in addr_infos))
 
         # Validate ALL resolved IPs - if any is blocked, reject
         for ip in ips:
@@ -589,6 +602,12 @@ class WebFetcher:
         self._http_client = httpx.Client(
             timeout=self.settings.web_fetch_timeout,
             follow_redirects=False,
+            # Proxies could resolve the original host outside our IP policy.
+            # Honor custom CA bundles separately from proxy environment settings.
+            trust_env=False,
+            verify=httpx.create_ssl_context(trust_env=True),
+            # IP-based pool keys must not reuse a TLS session for another name.
+            limits=httpx.Limits(max_keepalive_connections=0),
         )
 
     def fetch(
@@ -722,14 +741,18 @@ class WebFetcher:
             original_host: Original hostname for Host header
             original_url: Original URL for result reporting
         """
-        # Set Host header to original hostname (required for virtual hosting)
-        headers = {"Host": original_host}
+        origin = httpx.URL(original_url)
+        # HTTP authority includes a non-default port and brackets IPv6 correctly.
+        headers = {"Host": origin.netloc.decode("ascii")}
 
         # follow_redirects is pinned per request, not just on the client, so a
         # differently-configured client cannot re-enable transport-level
         # redirect following.
         response = self._http_client.get(
-            safe_url, headers=headers, follow_redirects=False
+            safe_url,
+            headers=headers,
+            follow_redirects=False,
+            extensions={"sni_hostname": origin.raw_host.decode("ascii")},
         )
 
         if 300 <= response.status_code < 400:
@@ -780,14 +803,28 @@ class WebFetcher:
         # -L is deliberately absent: curl must not follow redirects either.
         # Headers are dumped to a file so a 3xx can be handed back to fetch()
         # for validation.
+        # Keep the original URL's TLS name/HTTP authority, while connecting only
+        # to the validated address. URL credentials were never forwarded by the
+        # IP-based transport, so strip them here too.
+        origin = httpx.URL(original_url).copy_with(username="", password="")
+        port = origin.port or (443 if origin.scheme == "https" else 80)
+        source_host = origin.raw_host.decode("ascii")
+        target_ip = httpx.URL(safe_url).host
+        source_host = f"[{source_host}]" if ":" in source_host else source_host
+        target_ip = f"[{target_ip}]" if ":" in target_ip else target_ip
         header_fd, header_path = tempfile.mkstemp(prefix="lag-curl-", suffix=".hdr")
         os.close(header_fd)
 
         try:
             cmd = [
                 "curl",
+                "--disable",  # First option: ignore .curlrc (including insecure/-L).
                 "-sS",
                 "--compressed",
+                "--noproxy",
+                "*",
+                "--connect-to",
+                f"{source_host}:{port}:{target_ip}:{port}",
                 "--max-redirs",
                 "0",
                 "-D",
@@ -796,13 +833,10 @@ class WebFetcher:
                 str(self.settings.web_fetch_timeout),
             ]
 
-            # Add Host header for virtual hosting
-            cmd.extend(["-H", f"Host: {original_host}"])
-
             for key, value in self.CHROME_HEADERS.items():
                 cmd.extend(["-H", f"{key}: {value}"])
 
-            cmd.append(safe_url)
+            cmd.append(str(origin))
 
             # Execute curl (using subprocess with list args - no shell injection)
             result = subprocess.run(
