@@ -454,3 +454,19 @@ def test_graph_is_dropped_after_submit(client, comfy):
 def test_sdxl_template_prompts_are_blank():
     graph = json.loads((media_jobs.REPO_ROOT / "config/media_workflows/sdxl_t2i.api.json").read_text())
     assert graph["6"]["inputs"]["text"] == "" and graph["7"]["inputs"]["text"] == ""
+
+
+def test_qwen_turbo_workflow_ships_with_a_fixed_schedule(client, comfy):
+    from src.config import get_settings
+
+    graph, spec = media_jobs.load_workflow(get_settings(), "qwen_image_turbo_t2i")
+    assert set(spec) == {"prompt", "negative_prompt", "seed", "width", "height"}
+    assert graph["451"]["inputs"]["unet_name"] == "qwen_image_2.1_turbo_int8_convrot.safetensors"
+    assert graph["486"]["class_type"] == "SamplerCustomAdvanced"
+    built = media_jobs.build_graph(graph, spec, {"prompt": "a red lighthouse", "seed": 7, "width": 768})
+    assert built["452"]["inputs"]["prompt"] == "a red lighthouse"
+    assert built["488"]["inputs"]["noise_seed"] == 7
+    assert built["456"]["inputs"]["width"] == 768
+    response = client.post("/v1/media/jobs", headers=HEADERS,
+                           json={"workflow": "qwen_image_turbo_t2i", "params": {"prompt": "x", "steps": 8}})
+    assert response.status_code == 422

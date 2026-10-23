@@ -111,6 +111,14 @@ stores the results. Callers can only set the parameters a workflow declares;
 text is placed into node inputs and never changes the graph. One job runs at a
 time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; output files stay on disk. All `/v1/media` endpoints require authentication.
 
+Shipped workflows (model files go in ComfyUI's `models/` folders):
+
+| Workflow | Model | Settable params |
+|----------|-------|-----------------|
+| `qwen_image_t2i` | Qwen-Image-2.1 INT8 (`qwen_image_2.1_int8_convrot`), 25 steps | prompt, negative_prompt, seed, width, height, steps |
+| `qwen_image_turbo_t2i` | Qwen-Image-2.1 Turbo INT8 (`qwen_image_2.1_turbo_int8_convrot`), fixed 8-step schedule; ~3x faster drafts, weaker at small rendered text | prompt, negative_prompt, seed, width, height |
+| `sdxl_t2i` | SDXL base 1.0 | prompt, negative_prompt, seed, width, height, steps |
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `COMFYUI_HOST` | `http://127.0.0.1:8188` | ComfyUI server URL |

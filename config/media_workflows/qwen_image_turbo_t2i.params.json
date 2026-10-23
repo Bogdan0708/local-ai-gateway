@@ -1,0 +1,59 @@
+{
+  "prompt": {
+    "type": "string",
+    "max_length": 2000,
+    "required": true,
+    "targets": [
+      [
+        "452",
+        "prompt"
+      ]
+    ]
+  },
+  "negative_prompt": {
+    "type": "string",
+    "max_length": 2000,
+    "targets": [
+      [
+        "452",
+        "negative_prompt"
+      ]
+    ]
+  },
+  "width": {
+    "type": "integer",
+    "min": 256,
+    "max": 2048,
+    "multiple_of": 16,
+    "targets": [
+      [
+        "456",
+        "width"
+      ]
+    ]
+  },
+  "height": {
+    "type": "integer",
+    "min": 256,
+    "max": 2048,
+    "multiple_of": 16,
+    "targets": [
+      [
+        "456",
+        "height"
+      ]
+    ]
+  },
+  "seed": {
+    "type": "integer",
+    "min": 0,
+    "max": 4294967295,
+    "random_default": true,
+    "targets": [
+      [
+        "488",
+        "noise_seed"
+      ]
+    ]
+  }
+}
