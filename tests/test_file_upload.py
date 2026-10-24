@@ -38,7 +38,7 @@ def test_upload_is_indexed_under_its_original_name(upload):
     response = send("hub-note.md")
     assert response.status_code == 200, response.text
     assert response.json()["chunks"] >= 1
-    sources = [d.metadata.get("source", "") for d in memory.add_documents.call_args.args[0]]
+    sources = [d.metadata.get("source", "") for d in memory.replace_source.call_args.args[1]]
     assert sources and all(s.endswith("hub-note.md") for s in sources)
     assert len(staged_files(documents)) == 1
 
@@ -48,7 +48,7 @@ def test_upload_filename_cannot_escape_the_staging_dir(upload, tmp_path):
     response = send("../../escape.md")
     assert response.status_code == 200, response.text
     assert not (tmp_path / "escape.md").exists()
-    sources = [d.metadata.get("source", "") for d in memory.add_documents.call_args.args[0]]
+    sources = [d.metadata.get("source", "") for d in memory.replace_source.call_args.args[1]]
     assert all(str(documents) in s for s in sources)
     assert len(staged_files(documents)) == 1
 
@@ -58,7 +58,7 @@ def test_rejected_upload_is_not_indexed_and_leaves_nothing_behind(upload, filena
     send, memory, documents = upload
     response = send(filename)
     assert response.status_code in (400, 422), response.text
-    memory.add_documents.assert_not_called()
+    memory.replace_source.assert_not_called()
     assert staged_files(documents) == []
 
 
@@ -68,7 +68,7 @@ def test_successful_upload_keeps_its_source_readable(upload):
     send, memory, documents = upload
     response = send("durable-note.md")
     assert response.status_code == 200, response.text
-    indexed = memory.add_documents.call_args.args[0]
+    indexed = memory.replace_source.call_args.args[1]
     assert indexed
     source = Path(indexed[0].metadata["source"])
     assert source.is_relative_to(documents)
@@ -81,7 +81,7 @@ def test_short_markdown_upload_is_actually_indexed(upload):
     response = send("short.md", b"# Note\n\nKeep the quasar launch checklist.")
     assert response.status_code == 200, response.text
     assert response.json()["chunks"] > 0
-    indexed = memory.add_documents.call_args.args[0]
+    indexed = memory.replace_source.call_args.args[1]
     assert any("quasar launch checklist" in doc.content for doc in indexed)
 
 
@@ -89,7 +89,7 @@ def test_empty_upload_is_rejected_and_removed(upload):
     send, memory, documents = upload
     response = send("empty.md", b" \n\t")
     assert response.status_code == 400, response.text
-    memory.add_documents.assert_not_called()
+    assert all(not call.args[1] for call in memory.replace_source.call_args_list)
     assert staged_files(documents) == []
 
 
@@ -123,24 +123,31 @@ def test_uploaded_source_can_be_listed_and_read(stored_upload):
     assert memory.get_stats()["total_documents"] > 0
 
 
-def test_upload_error_after_storage_commit_preserves_indexed_source(stored_upload, monkeypatch):
+def test_upload_error_with_pending_recovery_preserves_indexed_source(stored_upload, monkeypatch):
     from pathlib import Path
 
     client, headers, _, memory = stored_upload
     original = memory._collection.upsert
+    original_delete = memory._collection.delete
 
     def commit_then_fail(**kwargs):
         original(**kwargs)
         raise RuntimeError("synthetic lost acknowledgement after commit")
 
+    def unavailable_rollback(**kwargs):
+        raise RuntimeError("synthetic rollback outage")
+
     monkeypatch.setattr(memory._collection, "upsert", commit_then_fail)
+    monkeypatch.setattr(memory._collection, "delete", unavailable_rollback)
     content = b"# Checklist\n\nKeep the quasar launch checklist."
     response = client.post("/v1/files", headers=headers, files={"file": ("checklist.md", content, "text/markdown")})
     assert response.status_code == 400, response.text
     results = memory._collection.get(include=["metadatas"])
     assert len(results["ids"]) == 1
     assert Path(results["metadatas"][0]["source"]).read_bytes() == content
+    monkeypatch.setattr(memory._collection, "delete", original_delete)
     assert memory.search_bm25("deleted") == []
+    assert memory.get_stats()["total_documents"] == 0
 
 
 def test_upload_error_before_storage_commit_removes_new_file(stored_upload, monkeypatch):
@@ -175,7 +182,7 @@ def test_unavailable_commit_check_keeps_source_for_recovery(stored_upload, monke
     response = client.post("/v1/files", headers=headers, files={"file": ("checklist.md", b"# Checklist\n\nquasar launch", "text/markdown")})
     assert response.status_code == 400
     assert len(staged_files(documents)) == 1
-    assert memory.get_stats()["total_documents"] == 1
+    assert memory.get_stats()["total_documents"] == 0
 
 
 def test_failed_new_upload_preserves_existing_source(stored_upload, monkeypatch):
@@ -230,7 +237,12 @@ def test_file_watcher_cannot_index_a_partial_upload(stored_upload, monkeypatch, 
         def __exit__(self, *args):
             self.handle.close()
 
-    monkeypatch.setattr(os, "fdopen", ObservedWriter)
+    def observe_upload_only(fd, mode, *args, **kwargs):
+        if mode == "wb":
+            return ObservedWriter(fd, mode)
+        return original_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", observe_upload_only)
     content = b"# Checklist\n\n" + b"quasar launch checklist and mariner rollback. " * 6
     response = client.post("/v1/files", headers=headers, files={"file": ("checklist.md", content, "text/markdown")})
     assert response.status_code == 200, response.text
@@ -250,3 +262,33 @@ def test_watcher_still_indexes_ordinary_files_under_uploads(stored_upload):
     FileWatcherHandler(DocumentProcessor(), memory)._process_file(ordinary)
     assert memory.get_stats()["total_documents"] == 1
     assert [r.document.metadata["source"] for r in memory.search_bm25("quasar")] == [str(ordinary)]
+
+
+@pytest.mark.parametrize("endpoint", ["/health", "/v1/files"])
+def test_public_metadata_reads_recover_before_exposing_a_revision(stored_upload, monkeypatch, endpoint):
+    from src.file_service import FileIngestionService
+
+    client, headers, documents, memory = stored_upload
+    documents.mkdir(parents=True)
+    path = documents / "note.md"
+    path.write_text("# Note\n\nquasar accepted instructions")
+    service = FileIngestionService()
+    service.ingest_file(path)
+    path.write_text("# Note\n\nzenith uncommitted instructions")
+    original_delete = memory._collection.delete
+
+    def fail_cleanup(**kwargs):
+        raise RuntimeError("synthetic cleanup outage")
+
+    monkeypatch.setattr(memory._collection, "delete", fail_cleanup)
+    with pytest.raises(RuntimeError, match="synthetic cleanup outage"):
+        service.ingest_file(path)
+    assert memory._collection.count() == 2
+    monkeypatch.setattr(memory._collection, "delete", original_delete)
+    response = client.get(endpoint, headers=headers)
+    assert response.status_code == 200, response.text
+    if endpoint == "/health":
+        assert response.json()["memory_documents"] == 1
+    else:
+        assert len(response.json()) == 1
+        assert response.json()[0]["chunks"] == 1

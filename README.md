@@ -168,13 +168,31 @@ skips them to avoid partial reads and late writes after cleanup.
 Re-ingesting a document ID updates its content using Chroma's
 [upsert operation](https://docs.trychroma.com/reference/js-collection#upsert).
 Repeated IDs within a batch use the last supplied content. Keyword search
-refreshes from persisted records after gateway updates or deletions; a failed
-refresh returns an error instead of serving stale results. The two halves of a
-hybrid search share a lock with mutations in this gateway process. Keyword
+checks persisted text and metadata on every search, including writes by another
+client or process, and rebuilds its index only when that snapshot changes. A
+failed refresh returns an error instead of serving stale results. The two halves of a
+hybrid search share a collection lock with cooperating gateway and CLI writers. Keyword
 scoring uses positive IDF smoothing so matches are retained in small collections.
-CLI ingestion in another process is not an automatic keyword-cache invalidation;
-restart the gateway after external ingestion. Ingestion currently retains older
-content-hash revisions when a file changes; it does not synchronize file versions.
+
+File ingestion replaces the previous revision of the same canonical path,
+including removal of old trailing chunks or all chunks for an empty file.
+Separate paths have separate chunk IDs even when their contents are identical.
+A file changed during processing must be retried. Failed parsing or embedding
+preserves the previous accepted revision.
+
+Replacement uses a private recovery journal and a native lock under the Chroma
+directory. An interrupted or failed replacement restores its previous records
+before the next guarded read or write. If recovery cannot complete, access fails
+until storage is available; it does not serve the partial replacement. Keep the
+recovery journal with the database when backing it up. Direct Chroma writers
+bypass this coordination and should not run during source replacement.
+
+Existing file chunks migrate when their recorded source matches the canonical
+path or a supplied absolute alias. Ambiguous relative or unmatched legacy aliases
+are preserved. Re-ingest
+existing directories once to register separate ownership for identical files;
+provenance that older shared IDs never recorded cannot be reconstructed.
+This change does not remove records automatically when a file is deleted or moved.
 
 ```bash
 # Upload a file

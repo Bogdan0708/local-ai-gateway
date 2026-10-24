@@ -470,7 +470,7 @@ async def health_check():
         timestamp=datetime.now(timezone.utc).isoformat(),
         llm_provider=settings.llm_provider,
         llm_model=settings.active_chat_model,
-        memory_documents=memory._collection.count(),
+        memory_documents=memory.get_stats()["total_documents"],
     )
 
 
@@ -652,15 +652,11 @@ async def list_files(
     """List indexed files in the knowledge base."""
     memory = get_memory()
 
-    # Get unique files from metadata
-    if memory._collection.count() == 0:
-        return []
-
-    results = memory._collection.get(include=["metadatas"])
+    metadata_snapshot = memory.get_document_metadata()
 
     # Group by source file
     files: dict[str, FileInfo] = {}
-    for metadata in results["metadatas"]:
+    for metadata in metadata_snapshot:
         if not metadata:
             continue
         source = metadata.get("source", "unknown")
