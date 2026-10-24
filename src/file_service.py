@@ -12,6 +12,7 @@ import fnmatch
 import hashlib
 import logging
 import mimetypes
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Optional
@@ -315,6 +316,9 @@ class DocumentProcessor:
         """Get the appropriate document loader."""
         suffix = file_path.suffix.lower()
 
+        if self.use_smart_chunking and suffix in (".md", ".markdown", ".html", ".htm"):
+            # Structure-aware chunkers need markup, not loader-flattened text.
+            return TextLoader(str(file_path), encoding="utf-8")
         if suffix == ".pdf":
             return PyPDFLoader(str(file_path))
         elif suffix in (".md", ".markdown"):
@@ -369,6 +373,15 @@ class FileWatcherHandler(FileSystemEventHandler):
     def _process_file(self, file_path: Path) -> None:
         """Process a file and add to memory."""
         try:
+            # API requests own this namespace, including failure cleanup. A
+            # watcher must not index partial bytes or commit after that cleanup.
+            managed_root = (self.processor.validator.settings.documents_path / "uploads").resolve()
+            try:
+                relative = file_path.resolve().relative_to(managed_root)
+            except ValueError:
+                relative = None
+            if relative is not None and len(relative.parts) >= 2 and re.fullmatch(r"[0-9a-f]{32}", relative.parts[0]):
+                return
             documents = list(self.processor.process_file(file_path))
             if documents:
                 self.memory.add_documents(documents)

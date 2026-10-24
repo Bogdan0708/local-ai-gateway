@@ -157,6 +157,25 @@ python run.py --ingest /path/to/documents
 
 ### Via API
 
+Successful uploads are retained under `DOCUMENTS_PATH/uploads/<id>/<filename>`
+so file listings and citations point to readable sources. Empty files and files
+that produce no indexable text return HTTP 400. Rejected uploads are removed;
+a failed indexing attempt keeps its source if chunks were already committed or
+storage cannot confirm that the source is unused. Uploads do not expire automatically.
+The request owns indexing for these managed upload directories; the file watcher
+skips them to avoid partial reads and late writes after cleanup.
+
+Re-ingesting a document ID updates its content using Chroma's
+[upsert operation](https://docs.trychroma.com/reference/js-collection#upsert).
+Repeated IDs within a batch use the last supplied content. Keyword search
+refreshes from persisted records after gateway updates or deletions; a failed
+refresh returns an error instead of serving stale results. The two halves of a
+hybrid search share a lock with mutations in this gateway process. Keyword
+scoring uses positive IDF smoothing so matches are retained in small collections.
+CLI ingestion in another process is not an automatic keyword-cache invalidation;
+restart the gateway after external ingestion. Ingestion currently retains older
+content-hash revisions when a file changes; it does not synchronize file versions.
+
 ```bash
 # Upload a file
 curl -X POST http://localhost:8000/v1/files \

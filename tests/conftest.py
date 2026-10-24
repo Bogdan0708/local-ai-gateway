@@ -46,3 +46,16 @@ def settings_env(monkeypatch):
     yield _apply
 
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def persistent_memory(tmp_path, monkeypatch):
+    """Real temporary storage and keyword index; replace only external inference."""
+    from src.memory import EmbeddingsProvider, HybridMemory
+
+    monkeypatch.setattr(EmbeddingsProvider, "embed", lambda self, text: [1.0, 0.25, 0.5])
+    memory = HybridMemory(persist_dir=tmp_path / "chroma", enable_reranker=False)
+    try:
+        yield memory
+    finally:
+        memory.close()

@@ -329,7 +329,7 @@ class StructureAwareChunker:
                     # Save previous chunk if exists
                     if current_content:
                         chunk_text = '\n'.join(current_content)
-                        if len(chunk_text) >= self.config.min_chunk_size:
+                        if chunk_text.strip():
                             chunks.append(Chunk(
                                 content=chunk_text,
                                 metadata={
@@ -356,7 +356,7 @@ class StructureAwareChunker:
         # Don't forget the last chunk
         if current_content:
             chunk_text = '\n'.join(current_content)
-            if len(chunk_text) >= self.config.min_chunk_size:
+            if chunk_text.strip():
                 chunks.append(Chunk(
                     content=chunk_text,
                     metadata={
@@ -388,52 +388,51 @@ class StructureAwareChunker:
         """Chunk HTML preserving header hierarchy."""
         # Extract text from HTML first
         try:
-            from bs4 import BeautifulSoup
+            from bs4 import BeautifulSoup, Comment, Doctype, NavigableString
 
             soup = BeautifulSoup(text, 'html.parser')
-
             chunks = []
             current_content = []
             current_headers = {}
+            headings = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+            hidden = {'head', 'script', 'style', 'template', 'noscript'}
+            blocks = headings | {
+                'body', 'div', 'p', 'li', 'ul', 'ol', 'table', 'tr', 'td', 'th',
+                'section', 'article', 'header', 'footer', 'main', 'aside', 'nav',
+                'blockquote', 'pre', 'figure', 'figcaption', 'dl', 'dt', 'dd',
+            }
+            last_block = None
 
-            # Process all elements
-            for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'pre', 'code', 'div']):
-                if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                    # Save previous chunk
-                    if current_content:
-                        chunk_text = '\n'.join(current_content)
-                        if len(chunk_text) >= self.config.min_chunk_size:
-                            chunks.append(Chunk(
-                                content=chunk_text,
-                                metadata={
-                                    "strategy": "structure",
-                                    "headers": current_headers.copy()
-                                },
-                                index=len(chunks)
-                            ))
-                        current_content = []
-
-                    # Update header
-                    current_headers[element.name] = element.get_text().strip()
-
-                else:
-                    text = element.get_text().strip()
-                    if text:
-                        current_content.append(text)
-
-            # Last chunk
-            if current_content:
-                chunk_text = '\n'.join(current_content)
-                if len(chunk_text) >= self.config.min_chunk_size:
+            def save_section():
+                chunk_text = ''.join(current_content).strip()
+                if chunk_text:
                     chunks.append(Chunk(
                         content=chunk_text,
-                        metadata={
-                            "strategy": "structure",
-                            "headers": current_headers.copy()
-                        },
+                        metadata={"strategy": "structure", "headers": current_headers.copy()},
                         index=len(chunks)
                     ))
+                current_content.clear()
 
+            # Text nodes preserve inline adjacency; block ancestors introduce
+            # separators. Reading container .get_text() would duplicate children.
+            for element in soup.descendants:
+                name = getattr(element, 'name', None)
+                if name in hidden or any(parent.name in hidden for parent in element.parents):
+                    continue
+                if name in headings:
+                    save_section()
+                    current_headers[name] = element.get_text().strip()
+                    last_block = None
+                elif name in {'br', 'hr'}:
+                    current_content.append('\n')
+                elif isinstance(element, NavigableString) and not isinstance(element, (Comment, Doctype)):
+                    block = next((parent for parent in element.parents if parent.name in blocks), soup)
+                    if current_content and block is not last_block:
+                        current_content.append('\n')
+                    current_content.append(str(element))
+                    last_block = block
+
+            save_section()
             return chunks
 
         except ImportError:

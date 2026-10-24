@@ -10,6 +10,8 @@ Implements:
 
 import hashlib
 import logging
+import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,6 +107,17 @@ class EmbeddingsProvider:
 OllamaEmbeddings = EmbeddingsProvider
 
 
+class _SmoothedBM25Okapi(BM25Okapi):
+    """Use Lucene's positive IDF so small corpora retain keyword matches."""
+
+    def _calc_idf(self, frequencies):
+        # https://lucene.apache.org/core/9_12_1/core/org/apache/lucene/search/similarities/BM25Similarity.html
+        self.idf = {
+            word: math.log1p((self.corpus_size - frequency + 0.5) / (frequency + 0.5))
+            for word, frequency in frequencies.items()
+        }
+
+
 class BM25Index:
     """BM25 index for keyword-based search."""
 
@@ -121,8 +134,8 @@ class BM25Index:
             self._tokenized_corpus.append(tokens)
 
         # Rebuild index
-        if self._tokenized_corpus:
-            self._index = BM25Okapi(self._tokenized_corpus)
+        if any(self._tokenized_corpus):
+            self._index = _SmoothedBM25Okapi(self._tokenized_corpus)
 
     def search(self, query: str, k: int = 10) -> list[SearchResult]:
         """Search using BM25."""
@@ -180,6 +193,8 @@ class HybridMemory:
 
         self.persist_dir = persist_dir or settings.chroma_persist_dir
         self.collection_name = collection_name
+        self._index_lock = threading.RLock()
+        self._bm25_dirty = True
 
         # Initialize ChromaDB
         self._chroma_client = chromadb.PersistentClient(
@@ -212,25 +227,19 @@ class HybridMemory:
         )
 
     def _sync_bm25_from_chroma(self) -> None:
-        """Sync BM25 index from ChromaDB on startup."""
-        self._bm25.clear()
-
-        # Get all documents from ChromaDB
-        if self._collection.count() == 0:
-            return
-
+        """Publish a complete keyword snapshot of the persisted collection."""
         results = self._collection.get(include=["documents", "metadatas"])
-
-        documents = []
-        for doc_id, content, metadata in zip(
-            results["ids"], results["documents"], results["metadatas"]
-        ):
-            documents.append(
-                Document(content=content, metadata=metadata or {}, id=doc_id)
+        documents = [
+            Document(content=content, metadata=metadata or {}, id=doc_id)
+            for doc_id, content, metadata in zip(
+                results["ids"], results["documents"], results["metadatas"]
             )
-
-        self._bm25.add_documents(documents)
-        logger.info(f"Synced {len(documents)} documents to BM25 index")
+        ]
+        updated = BM25Index()
+        updated.add_documents(documents)
+        self._bm25 = updated
+        self._bm25_dirty = False
+        logger.info("Synced %s documents to BM25 index", len(documents))
 
     @property
     def reranker(self) -> Optional[CrossEncoderReranker]:
@@ -310,61 +319,59 @@ class HybridMemory:
         return self.add_documents([document])[0]
 
     def add_documents(self, documents: list[Document]) -> list[str]:
-        """Add multiple documents to both indexes."""
+        """Upsert unique IDs into persistent storage; the last input for an ID wins."""
         if not documents:
             return []
-
-        # Generate embeddings
+        documents = list({doc.id: doc for doc in documents}.values())
         contents = [doc.content for doc in documents]
         embeddings = self._embeddings.embed_batch(contents)
-
-        # Add to ChromaDB
         ids = [doc.id for doc in documents]
-        metadatas = [doc.metadata for doc in documents]
-
-        self._collection.add(
-            ids=ids,
-            documents=contents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-
-        # Add to BM25
-        self._bm25.add_documents(documents)
-
-        logger.info(f"Added {len(documents)} documents to memory")
+        with self._index_lock:
+            # Invalidate first: even a mutation that raises may have reached storage.
+            self._bm25_dirty = True
+            self._collection.upsert(
+                ids=ids,
+                documents=contents,
+                embeddings=embeddings,
+                metadatas=[doc.metadata or None for doc in documents],
+            )
+        logger.info("Upserted %s documents into memory", len(documents))
         return ids
 
     def search_semantic(self, query: str, k: int = 10) -> list[SearchResult]:
         """Search using semantic similarity only."""
-        if self._collection.count() == 0:
-            return []
+        with self._index_lock:
+            if self._collection.count() == 0:
+                return []
 
-        query_embedding = self._embeddings.embed(query)
+            query_embedding = self._embeddings.embed(query)
 
-        results = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=k,
-            include=["documents", "metadatas", "distances"],
-        )
+            results = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=k,
+                include=["documents", "metadatas", "distances"],
+            )
 
-        search_results = []
-        for doc_id, content, metadata, distance in zip(
-            results["ids"][0],
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
-            # Convert cosine distance to similarity score
-            score = 1 - distance
-            doc = Document(content=content, metadata=metadata or {}, id=doc_id)
-            search_results.append(SearchResult(document=doc, score=score, source="semantic"))
+            search_results = []
+            for doc_id, content, metadata, distance in zip(
+                results["ids"][0],
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0],
+            ):
+                # Convert cosine distance to similarity score
+                score = 1 - distance
+                doc = Document(content=content, metadata=metadata or {}, id=doc_id)
+                search_results.append(SearchResult(document=doc, score=score, source="semantic"))
 
-        return search_results
+            return search_results
 
     def search_bm25(self, query: str, k: int = 10) -> list[SearchResult]:
         """Search using BM25 keyword matching only."""
-        return self._bm25.search(query, k)
+        with self._index_lock:
+            if self._bm25_dirty:
+                self._sync_bm25_from_chroma()
+            return self._bm25.search(query, k)
 
     def search_hybrid(
         self,
@@ -386,47 +393,48 @@ class HybridMemory:
             Combined and reranked search results
         """
         # Get results from both methods
-        semantic_results = self.search_semantic(query, k=k * 2)
-        bm25_results = self.search_bm25(query, k=k * 2)
+        with self._index_lock:
+            semantic_results = self.search_semantic(query, k=k * 2)
+            bm25_results = self.search_bm25(query, k=k * 2)
 
-        # Apply Reciprocal Rank Fusion
-        rrf_scores: dict[str, float] = {}
-        doc_map: dict[str, Document] = {}
+            # Apply Reciprocal Rank Fusion
+            rrf_scores: dict[str, float] = {}
+            doc_map: dict[str, Document] = {}
 
-        # RRF constant (typically 60)
-        rrf_k = 60
+            # RRF constant (typically 60)
+            rrf_k = 60
 
-        # Score semantic results
-        for rank, result in enumerate(semantic_results):
-            doc_id = result.document.id
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + semantic_weight / (
-                rrf_k + rank + 1
-            )
-            doc_map[doc_id] = result.document
-
-        # Score BM25 results
-        for rank, result in enumerate(bm25_results):
-            doc_id = result.document.id
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + bm25_weight / (
-                rrf_k + rank + 1
-            )
-            doc_map[doc_id] = result.document
-
-        # Sort by RRF score
-        sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-
-        # Build final results
-        results = []
-        for doc_id in sorted_ids[:k]:
-            results.append(
-                SearchResult(
-                    document=doc_map[doc_id],
-                    score=rrf_scores[doc_id],
-                    source="hybrid",
+            # Score semantic results
+            for rank, result in enumerate(semantic_results):
+                doc_id = result.document.id
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + semantic_weight / (
+                    rrf_k + rank + 1
                 )
-            )
+                doc_map[doc_id] = result.document
 
-        return results
+            # Score BM25 results
+            for rank, result in enumerate(bm25_results):
+                doc_id = result.document.id
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + bm25_weight / (
+                    rrf_k + rank + 1
+                )
+                doc_map[doc_id] = result.document
+
+            # Sort by RRF score
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+
+            # Build final results
+            results = []
+            for doc_id in sorted_ids[:k]:
+                results.append(
+                    SearchResult(
+                        document=doc_map[doc_id],
+                        score=rrf_scores[doc_id],
+                        source="hybrid",
+                    )
+                )
+
+            return results
 
     def search(
         self,
@@ -469,15 +477,20 @@ class HybridMemory:
         return results
 
     def delete_document(self, doc_id: str) -> bool:
-        """Delete a document by ID."""
-        try:
-            self._collection.delete(ids=[doc_id])
-            # Note: BM25 index would need rebuild for deletion
-            # For simplicity, we don't remove from BM25 here
-            return True
-        except Exception as e:
-            logger.error(f"Failed to delete document {doc_id}: {e}")
-            return False
+        """Delete a persisted document and invalidate its keyword snapshot."""
+        with self._index_lock:
+            self._bm25_dirty = True
+            try:
+                self._collection.delete(ids=[doc_id])
+                return True
+            except Exception as e:
+                logger.error(f"Failed to delete document {doc_id}: {e}")
+                return False
+
+    def has_source(self, source: str) -> bool:
+        """Whether any persisted chunk still references a source file."""
+        with self._index_lock:
+            return bool(self._collection.get(where={"source": source}, limit=1, include=[])["ids"])
 
     def get_stats(self) -> dict[str, Any]:
         """Get memory statistics."""
