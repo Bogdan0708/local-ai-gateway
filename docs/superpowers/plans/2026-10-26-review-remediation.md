@@ -56,4 +56,27 @@ Normalize chunker calls, remove cancelled pending jobs, and correct live-check g
 - [x] Simulate old instructions against nondefault port/provider and an unrelated listener; record wrong target.
 - [x] Derive endpoints from effective Settings, verify process command and resolved checkout, and scope restarts/inference to explicit user authorization.
 - [x] Simulate corrected instructions against same scenario; expected correct endpoints and refusal to stop unrelated listener.
-- [ ] Commit guidance, run full suite/lint/pip check/secret scans and independent final review.
+- [x] Commit guidance, run full suite/lint/pip check/secret scans and independent final review.
+
+## Verification record
+
+- Integration baseline: 291 passed before new fixes.
+- Explicit chunking regressions: 10 expected failures before implementation;
+  focused chunking/ingestion/source-revision verification: 46 passed afterward.
+- Queue regressions: 2 expected failures and 1 existing-behavior guard before
+  implementation; full media verification: 71 passed afterward.
+- Live-check application scenarios: corrected compatible-provider/nondefault-port,
+  unrelated-listener refusal, offline-only scope and IPv6/Ollama targets.
+- Final full offline suite: 304 passed, 12 existing dependency deprecation warnings,
+  Python 3.14.7. All source/tests also parse using Python 3.12 grammar; remote CI
+  for this integration branch has not run.
+- Ruff, pip check, CR-at-EOL diff check, directory and commit-history Gitleaks passed.
+- Independent whole-branch source review of code through fabf806: ready to merge,
+  no Critical, Important or Minor findings. Its optional broader format/strategy
+  test matrix is additional coverage, not evidence of an unresolved failure.
+- Review scope retained: no live inference/GPU/deployment acceptance or installed
+  ComfyUI compatibility claim; no fresh dependency resolution/advisory audit.
+  Documented raw-writer/moved-file/legacy-ownership exclusions remain. Existing
+  opt-in browser behavior and recursive/semantic whitespace/size policy were not
+  redesigned. These limits require separate validation if relied on in deployment.
+- No push, shared-branch merge, service restart or live-data changes were performed.
