@@ -466,3 +466,78 @@ def test_cancellation_uses_atomic_prompt_endpoint_without_legacy_interrupt(setup
             await manager.stop()
 
     asyncio.run(run())
+
+
+def test_cancelled_waiting_jobs_release_pending_storage(setup_manager):
+    setup, _ = setup_manager
+
+    async def run():
+        backend = Backend()
+        backend.delay = "history"
+        manager = await setup(backend, timeout=5)
+        enqueue(manager)
+        try:
+            await asyncio.wait_for(backend.entered.wait(), 1)
+            for _ in range(32):
+                waiting = enqueue(manager)
+                await manager.cancel(waiting)
+                assert manager.queued_count() == 0
+                assert manager._queue.qsize() == 0
+                assert waiting._settled.is_set()
+        finally:
+            backend.release.set()
+            await manager.stop()
+
+    asyncio.run(run())
+
+
+def test_cancellation_reopens_capacity_without_reordering_jobs(setup_manager):
+    setup, _ = setup_manager
+
+    async def run():
+        backend = Backend()
+        backend.delay = "history"
+        manager = await setup(backend, timeout=5)
+        first = enqueue(manager)
+        try:
+            await asyncio.wait_for(backend.entered.wait(), 1)
+            pending = [enqueue(manager) for _ in range(manager.settings.media_max_queued_jobs)]
+            overflow = media_jobs.Job(id=uuid.uuid4().hex, workflow="synthetic", params={}, graph={"1": {}})
+            with pytest.raises(asyncio.QueueFull):
+                manager.enqueue(overflow)
+            assert overflow.id not in manager.jobs
+            removed = pending.pop(1)
+            await manager.cancel(removed)
+            replacement = enqueue(manager)
+            survivors = [first, *pending, replacement]
+            assert manager._queue.qsize() == manager.settings.media_max_queued_jobs
+            backend.release.set()
+            await asyncio.wait_for(manager._queue.join(), 1)
+            assert all(job.status == media_jobs.SUCCEEDED for job in survivors)
+            assert [body["prompt_id"] for body in backend.submitted] == [job.prompt_id for job in survivors]
+            assert removed.prompt_id is None
+            assert manager._queue.qsize() == 0
+        finally:
+            backend.release.set()
+            await manager.stop()
+
+    asyncio.run(run())
+
+
+def test_cancel_before_worker_starts_preserves_next_wakeup(setup_manager):
+    setup, _ = setup_manager
+
+    async def run():
+        manager = await setup(Backend(), timeout=5)
+        try:
+            removed = enqueue(manager)
+            await manager.cancel(removed)
+            replacement = enqueue(manager)
+            await asyncio.wait_for(manager._queue.join(), 1)
+            assert removed.status == media_jobs.CANCELLED
+            assert replacement.status == media_jobs.SUCCEEDED
+            assert manager._queue.qsize() == 0
+        finally:
+            await manager.stop()
+
+    asyncio.run(run())

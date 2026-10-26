@@ -303,11 +303,25 @@ class Job:
         }
 
 
+class PendingJobQueue(asyncio.Queue[str]):
+    """FIFO queue whose cancelled waiting entries can release capacity immediately."""
+
+    def discard(self, job_id: str) -> None:
+        # Extend Queue in place so its waiting worker, join accounting and
+        # producer wakeups retain the same queue identity.
+        try:
+            self._queue.remove(job_id)
+        except ValueError:
+            return
+        self.task_done()
+        self._wakeup_next(self._putters)
+
+
 class MediaJobManager:
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
         self.settings: Optional[Settings] = None
-        self._queue: Optional[asyncio.Queue] = None
+        self._queue: Optional[PendingJobQueue] = None
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[ComfyUIClient] = None
         self._active_job: Optional[Job] = None
@@ -319,7 +333,7 @@ class MediaJobManager:
             raise RuntimeError("Media worker is already started")
         self.settings = get_settings()
         self.jobs = {}
-        self._queue = asyncio.Queue()
+        self._queue = PendingJobQueue(maxsize=self.settings.media_max_queued_jobs)
         self._client = make_comfy_client(self.settings)
         self._stopping = False
         self._task = asyncio.create_task(self._worker(), name="media-job-worker")
@@ -330,6 +344,7 @@ class MediaJobManager:
             if job.status not in FINISHED:
                 job.finish(CANCELLED, "gateway shutting down")
                 if job is not self._active_job:
+                    self._queue.discard(job.id)
                     job.graph = {}
                     job._settled.set()
         active = self._active_job
@@ -367,8 +382,8 @@ class MediaJobManager:
 
     def enqueue(self, job: Job) -> None:
         self._prune()
-        self.jobs[job.id] = job
         self._queue.put_nowait(job.id)
+        self.jobs[job.id] = job
 
     async def cancel(self, job: Job) -> None:
         if job.status in FINISHED:
@@ -379,6 +394,7 @@ class MediaJobManager:
                 self._job_task.cancel()
             await job._settled.wait()
         else:
+            self._queue.discard(job.id)
             job.graph = {}
             job._settled.set()
 
@@ -605,7 +621,10 @@ async def create_job(request: JobRequest) -> dict:
     if manager.queued_count() >= settings.media_max_queued_jobs:
         raise HTTPException(status_code=429, detail="Media job queue is full")
     job = Job(id=new_job_id(), workflow=request.workflow, params=values, graph=built)
-    manager.enqueue(job)
+    try:
+        manager.enqueue(job)
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=429, detail="Media job queue is full")
     return {"id": job.id, "status": job.status}
 
 
