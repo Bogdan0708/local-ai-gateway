@@ -469,7 +469,7 @@ async def health_check():
         timestamp=datetime.now(timezone.utc).isoformat(),
         llm_provider=settings.llm_provider,
         llm_model=settings.active_chat_model,
-        memory_documents=memory._collection.count(),
+        memory_documents=memory.get_stats()["total_documents"],
     )
 
 
@@ -650,15 +650,11 @@ async def list_files(
     """List indexed files in the knowledge base."""
     memory = get_memory()
 
-    # Get unique files from metadata
-    if memory._collection.count() == 0:
-        return []
-
-    results = memory._collection.get(include=["metadatas"])
+    metadata_snapshot = memory.get_document_metadata()
 
     # Group by source file
     files: dict[str, FileInfo] = {}
-    for metadata in results["metadatas"]:
+    for metadata in metadata_snapshot:
         if not metadata:
             continue
         source = metadata.get("source", "unknown")
@@ -694,26 +690,37 @@ async def upload_file(
     if safe_name in ("", ".", ".."):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing filename")
 
-    content = await file.read()
+    content = await file.read(settings.max_file_size_bytes + 1)
     if len(content) > settings.max_file_size_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File too large. Max: {settings.max_file_size_mb}MB",
         )
 
-    # Stage inside the documents dir: ingest_file only accepts paths under the configured
-    # documents/code dirs, and the original name becomes the indexed source.
     import uuid
 
-    staging_dir = settings.documents_path / "uploads" / uuid.uuid4().hex
-    staging_dir.mkdir(parents=True)
-    tmp_path = staging_dir / safe_name
-    tmp_path.write_bytes(content)
-
+    upload_dir = settings.documents_path / "uploads" / uuid.uuid4().hex
+    stored_path = upload_dir / safe_name
+    created_dir = created_file = indexed = check_index = False
+    service = None
     try:
+        validator = FileValidator()
+        validator.validate_path(stored_path)
+        validator.validate_extension(stored_path)
+        validator.validate_filename(stored_path)
+        upload_dir.mkdir(mode=0o700, parents=True)
+        created_dir = True
+        fd = os.open(stored_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created_file = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
         service = FileIngestionService()
-        chunk_count = service.ingest_file(tmp_path)
-
+        check_index = True
+        chunk_count = service.ingest_file(stored_path)
+        if chunk_count == 0:
+            check_index = False
+            raise ValueError("File contains no indexable text")
+        indexed = True
         return {
             "status": "success",
             "filename": file.filename,
@@ -727,8 +734,20 @@ async def upload_file(
             detail=f"Failed to index file: {e}",
         )
     finally:
-        tmp_path.unlink(missing_ok=True)
-        staging_dir.rmdir()
+        # An indexing error can occur after persistence; never remove a cited
+        # source, or assume that an unavailable store did not commit it.
+        keep_source = indexed
+        if not keep_source and check_index:
+            try:
+                keep_source = service.memory.has_source(str(stored_path))
+            except Exception:
+                keep_source = True
+                logger.exception("Retaining upload because index state could not be checked")
+        if not keep_source:
+            if created_file:
+                stored_path.unlink(missing_ok=True)
+            if created_dir:
+                upload_dir.rmdir()
 
 
 @app.post(

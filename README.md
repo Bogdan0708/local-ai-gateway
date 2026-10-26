@@ -109,7 +109,26 @@ The gateway submits saved ComfyUI workflows (`config/media_workflows/<name>.api.
 plus a `<name>.params.json` whitelist of settable inputs) to a ComfyUI server and
 stores the results. Callers can only set the parameters a workflow declares;
 text is placed into node inputs and never changes the graph. One job runs at a
-time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; output files stay on disk. All `/v1/media` endpoints require authentication.
+time, in order. The job list is held in memory (the newest 500 finished jobs) and resets on restart; successful output files stay on disk. All `/v1/media` endpoints require authentication.
+
+Media jobs require ComfyUI **0.42.1 or newer**. The gateway checks the version
+before submission and assigns the prompt UUID itself, so timeout or shutdown can
+identify its work even if the submission response has not arrived.
+
+One execution deadline covers submission checks, queue/history polling,
+downloads, and output writes. Downloads are streamed with a **64 MiB per-image
+limit**. Cancellation, timeout, and graceful shutdown stop the active operation,
+wait for any in-flight local file write to settle, and remove this job's
+incomplete images. Completed jobs keep their outputs. Queued jobs are cancelled
+without submission during shutdown.
+
+Remote cancellation uses ComfyUI's atomic `/api/jobs/{id}/cancel` endpoint,
+scoped to the job's prompt ID, with a five-second cleanup budget after the
+execution deadline. There is no fallback to the legacy interrupt endpoint.
+If ComfyUI is unreachable, the gateway logs that remote cancellation could not be confirmed. Cancellation is
+best effort: a server that accepts a submission after cleanup has finished can
+still run it. A forceful process termination cannot perform this cleanup; the job
+store is not durable.
 
 Shipped workflows (model files go in ComfyUI's `models/` folders):
 
@@ -124,7 +143,7 @@ Shipped workflows (model files go in ComfyUI's `models/` folders):
 | `COMFYUI_HOST` | `http://127.0.0.1:8188` | ComfyUI server URL |
 | `MEDIA_WORKFLOWS_DIR` | `config/media_workflows` | Workflow templates (relative to the repo) |
 | `MEDIA_OUTPUT_DIR` | `/data/media` | Images are written to `<dir>/<job_id>/<index>.<ext>` |
-| `MEDIA_JOB_TIMEOUT_S` | `900` | A running job is interrupted and failed after this long |
+| `MEDIA_JOB_TIMEOUT_S` | `900` | Total execution deadline in seconds; cancellation/file cleanup follows |
 | `MEDIA_MAX_QUEUED_JOBS` | `8` | Further submissions get HTTP 429 |
 
 ## Ingesting Documents
@@ -137,6 +156,43 @@ python run.py --ingest /path/to/documents
 ```
 
 ### Via API
+
+Successful uploads are retained under `DOCUMENTS_PATH/uploads/<id>/<filename>`
+so file listings and citations point to readable sources. Empty files and files
+that produce no indexable text return HTTP 400. Rejected uploads are removed;
+a failed indexing attempt keeps its source if chunks were already committed or
+storage cannot confirm that the source is unused. Uploads do not expire automatically.
+The request owns indexing for these managed upload directories; the file watcher
+skips them to avoid partial reads and late writes after cleanup.
+
+Re-ingesting a document ID updates its content using Chroma's
+[upsert operation](https://docs.trychroma.com/reference/js-collection#upsert).
+Repeated IDs within a batch use the last supplied content. Keyword search
+checks persisted text and metadata on every search, including writes by another
+client or process, and rebuilds its index only when that snapshot changes. A
+failed refresh returns an error instead of serving stale results. The two halves of a
+hybrid search share a collection lock with cooperating gateway and CLI writers. Keyword
+scoring uses positive IDF smoothing so matches are retained in small collections.
+
+File ingestion replaces the previous revision of the same canonical path,
+including removal of old trailing chunks or all chunks for an empty file.
+Separate paths have separate chunk IDs even when their contents are identical.
+A file changed during processing must be retried. Failed parsing or embedding
+preserves the previous accepted revision.
+
+Replacement uses a private recovery journal and a native lock under the Chroma
+directory. An interrupted or failed replacement restores its previous records
+before the next guarded read or write. If recovery cannot complete, access fails
+until storage is available; it does not serve the partial replacement. Keep the
+recovery journal with the database when backing it up. Direct Chroma writers
+bypass this coordination and should not run during source replacement.
+
+Existing file chunks migrate when their recorded source matches the canonical
+path or a supplied absolute alias. Ambiguous relative or unmatched legacy aliases
+are preserved. Re-ingest
+existing directories once to register separate ownership for identical files;
+provenance that older shared IDs never recorded cannot be reconstructed.
+This change does not remove records automatically when a file is deleted or moved.
 
 ```bash
 # Upload a file
@@ -195,6 +251,19 @@ fetcher, which re-runs the full check (scheme, hostname blocklist, DNS
 resolution, resolved-IP ranges, domain policy) against the new destination
 before requesting it, and the chain is capped at 5 hops. The curl fallback
 runs without `-L` and is subject to the same loop.
+
+HTTPX and curl connect directly to the validated IP while verifying the original
+hostname and preserving its HTTP authority, including a non-default port. They
+ignore proxy environment settings so a proxy cannot resolve a different address.
+HTTPX still honors `SSL_CERT_FILE` / `SSL_CERT_DIR`, and curl still honors
+`CURL_CA_BUNDLE`. Curl ignores `.curlrc` so it cannot disable certificate checks
+or enable automatic redirects. HTTPX closes connections after each fetch to keep
+TLS identities separate when multiple hostnames share an IP.
+DNS answers retain the operating system's address preference after validation,
+so deduplication does not randomly prefer an unreachable IPv4/IPv6 address.
+DNS and TLS use the same canonical IDNA hostname. Percent-escaped or scoped
+hostnames and port zero are refused before DNS to avoid parser differences
+between transports.
 
 ### Domain Allowlist
 
@@ -347,6 +416,19 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
 ```
+
+The dependency minimums include PDF parser security fixes and removal of the
+compromised emSign certificate chain. Update an existing environment explicitly:
+
+```bash
+python -m pip install --upgrade 'certifi>=2026.10.19' 'pypdf>=6.21.2'
+python -m pip check
+python -m pytest -q
+```
+
+Restart any running gateway process after updating its environment. The security
+tests check the default outbound TLS trust store and reject a malformed PDF in a
+subprocess with a timeout, so a vulnerable parser cannot hang the test runner.
 
 ## License
 

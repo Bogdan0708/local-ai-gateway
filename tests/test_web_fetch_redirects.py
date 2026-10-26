@@ -7,6 +7,8 @@ patched socket.getaddrinfo stand in for it.
 """
 
 import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 from unittest.mock import patch
 
 import httpx
@@ -189,3 +191,78 @@ def test_curl_tier_revalidates_redirect_targets(fetcher):
     with patch.object(wf.subprocess, "run", side_effect=fake_run):
         with pytest.raises(SecurityError):
             fetcher.fetch(f"http://{PUBLIC_A}/", use_cache=False, max_tier=2)
+
+
+def test_encoded_hostname_cannot_bypass_curl_ip_pinning(fetcher):
+    """A curl/HTTPX hostname-parser difference must not reach a local service."""
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"synthetic-private-service")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _fail_httpx(fetcher)
+    try:
+        with patch("socket.getaddrinfo", return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_A, 0)),
+        ]):
+            with pytest.raises(SecurityError, match="(?i)percent|encoded"):
+                fetcher.fetch(
+                    f"http://%31%32%37.0.0.1:{server.server_port}/private",
+                    use_cache=False, max_tier=2,
+                )
+        assert hits == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("url", [
+    "https://%67ateway.test/", "http://example.test:0/", "https://example.test:0/",
+])
+def test_ambiguous_authority_is_refused_before_transport(fetcher, url):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, text="unexpected request")
+
+    fetcher._http_client.close()
+    fetcher._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    with patch("socket.getaddrinfo", return_value=[
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_A, 0)),
+    ]):
+        with pytest.raises(SecurityError):
+            fetcher.fetch(url, use_cache=False, max_tier=1)
+    assert seen == []
+
+
+def test_full_fetch_uses_one_canonical_idna_name(fetcher):
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.host, request.headers["host"], request.extensions["sni_hostname"]))
+        return httpx.Response(200, text="synthetic canonical origin")
+
+    def dns(host, *args, **kwargs):
+        # Model the stdlib's IDNA2003 conversion if handed Unicode directly.
+        wire_name = host.encode("idna").decode("ascii")
+        ip = PUBLIC_A if wire_name == "xn--fa-hia.test" else PUBLIC_B
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+
+    fetcher._http_client.close()
+    fetcher._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    with patch("socket.getaddrinfo", side_effect=dns):
+        result = fetcher.fetch("https://faß.test/", use_cache=False, max_tier=1)
+    assert result.status_code == 200
+    assert seen == [(PUBLIC_A, "xn--fa-hia.test", "xn--fa-hia.test")]

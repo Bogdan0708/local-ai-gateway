@@ -12,6 +12,10 @@ import fnmatch
 import hashlib
 import logging
 import mimetypes
+import os
+import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Optional
@@ -30,7 +34,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import get_file_whitelist, get_settings
-from .memory import Document, get_memory
+from .memory import Document, file_source_id, get_memory
 from .chunking import (
     ChunkConfig,
     ChunkingStrategy,
@@ -190,44 +194,61 @@ class DocumentProcessor:
         Yields:
             Document chunks with metadata
         """
+        documents, _ = self.prepare_file(file_path)
+        yield from documents
+
+    def prepare_file(self, file_path: Path) -> tuple[list[Document], str]:
+        """Return chunks and their captured byte hash, including empty captures."""
         file_path = Path(file_path)
 
         # Validate file
         self.validator.validate(file_path)
+        resolved = file_path.resolve()
+        self.validator.validate(resolved)
+        stat = resolved.stat()
+        with self._captured_file(resolved, file_path.name) as (snapshot, file_hash, size):
+            base_metadata = {
+                "source": str(resolved),
+                "file_source_id": file_source_id(str(resolved)),
+                "filename": file_path.name,
+                "extension": file_path.suffix.lower(),
+                "size_bytes": size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
+                "file_hash": file_hash,
+            }
+            try:
+                # Hashing and parsing consume the same private immutable bytes.
+                documents = self._get_loader(snapshot).load()
+                if self.use_smart_chunking and self._should_use_smart_chunking(file_path):
+                    processed = list(self._process_with_smart_chunking(
+                        documents, file_path, file_hash, base_metadata
+                    ))
+                else:
+                    processed = list(self._process_with_langchain(
+                        documents, file_path, file_hash, base_metadata
+                    ))
+                return processed, file_hash
+            except Exception as e:
+                logger.error(f"Failed to process {file_path}: {e}")
+                raise
 
-        # Get file info for metadata
-        stat = file_path.stat()
-        file_hash = self._compute_hash(file_path)
-
-        base_metadata = {
-            "source": str(file_path),
-            "filename": file_path.name,
-            "extension": file_path.suffix.lower(),
-            "size_bytes": stat.st_size,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "indexed_at": datetime.now(timezone.utc).isoformat(),
-            "file_hash": file_hash,
-        }
-
-        # Load and split document
-        try:
-            loader = self._get_loader(file_path)
-            documents = loader.load()
-
-            # Use smart chunking if enabled and applicable
-            if self.use_smart_chunking and self._should_use_smart_chunking(file_path):
-                yield from self._process_with_smart_chunking(
-                    documents, file_path, file_hash, base_metadata
-                )
-            else:
-                # Fallback to LangChain splitters
-                yield from self._process_with_langchain(
-                    documents, file_path, file_hash, base_metadata
-                )
-
-        except Exception as e:
-            logger.error(f"Failed to process {file_path}: {e}")
-            raise
+    @contextmanager
+    def _captured_file(self, source: Path, filename: str):
+        with tempfile.TemporaryDirectory(prefix="local-ai-ingest-") as directory:
+            snapshot = Path(directory) / filename
+            digest = hashlib.sha256()
+            size = 0
+            fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as original, snapshot.open("xb") as captured:
+                snapshot.chmod(0o600)
+                for block in iter(lambda: original.read(8192), b""):
+                    size += len(block)
+                    if size > self.validator.whitelist.max_file_size_bytes:
+                        raise SecurityError("File grew beyond its permitted size while capturing")
+                    digest.update(block)
+                    captured.write(block)
+            yield snapshot, digest.hexdigest()[:16], size
 
     def _should_use_smart_chunking(self, file_path: Path) -> bool:
         """Determine if smart chunking should be used for this file type."""
@@ -279,7 +300,7 @@ class DocumentProcessor:
             yield Document(
                 content=chunk.content,
                 metadata=metadata,
-                id=f"{file_hash}_{i}",
+                id=f"file:{base_metadata['file_source_id']}:{file_hash}:{i}",
             )
 
         logger.debug(
@@ -298,19 +319,21 @@ class DocumentProcessor:
         splitter = self._get_splitter(file_path)
 
         for i, chunk in enumerate(splitter.split_documents(documents)):
-            metadata = {**base_metadata, "chunk_index": i, "chunking_strategy": "langchain"}
-            metadata.update(chunk.metadata)
+            metadata = {**chunk.metadata, **base_metadata, "chunk_index": i, "chunking_strategy": "langchain"}
 
             yield Document(
                 content=chunk.page_content,
                 metadata=metadata,
-                id=f"{file_hash}_{i}",
+                id=f"file:{base_metadata['file_source_id']}:{file_hash}:{i}",
             )
 
     def _get_loader(self, file_path: Path):
         """Get the appropriate document loader."""
         suffix = file_path.suffix.lower()
 
+        if self.use_smart_chunking and suffix in (".md", ".markdown", ".html", ".htm"):
+            # Structure-aware chunkers need markup, not loader-flattened text.
+            return TextLoader(str(file_path), encoding="utf-8")
         if suffix == ".pdf":
             return PyPDFLoader(str(file_path))
         elif suffix in (".md", ".markdown"):
@@ -346,6 +369,32 @@ class DocumentProcessor:
         return sha256.hexdigest()[:16]
 
 
+def _index_file(processor: DocumentProcessor, memory, file_path: Path) -> int:
+    """Prepare a stable file revision and replace only its known ownership."""
+    file_path = Path(file_path)
+    processor.validator.validate(file_path)
+    processor.validator.validate(file_path.resolve())
+    source = str(file_path.resolve())
+    initial = file_path.stat()
+    fingerprint = (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns)
+    expected_hash = processor._compute_hash(file_path)
+    documents, captured_hash = processor.prepare_file(file_path)
+
+    def check_current() -> None:
+        processor.validator.validate(file_path)
+        processor.validator.validate(file_path.resolve())
+        current = file_path.stat()
+        current_fingerprint = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+        if (str(file_path.resolve()) != source or current_fingerprint != fingerprint
+                or captured_hash != expected_hash
+                or processor._compute_hash(file_path) != expected_hash
+                or any(doc.metadata.get("file_hash") != expected_hash for doc in documents)):
+            raise RuntimeError("File changed while preparing its revision; retry ingestion")
+
+    memory.replace_source(source, documents, aliases=(str(file_path),), before_commit=check_current)
+    return len(documents)
+
+
 class FileWatcherHandler(FileSystemEventHandler):
     """Handle file system events for auto-indexing."""
 
@@ -365,10 +414,17 @@ class FileWatcherHandler(FileSystemEventHandler):
     def _process_file(self, file_path: Path) -> None:
         """Process a file and add to memory."""
         try:
-            documents = list(self.processor.process_file(file_path))
-            if documents:
-                self.memory.add_documents(documents)
-                logger.info(f"Indexed {len(documents)} chunks from {file_path}")
+            # API requests own this namespace, including failure cleanup. A
+            # watcher must not index partial bytes or commit after that cleanup.
+            managed_root = (self.processor.validator.settings.documents_path / "uploads").resolve()
+            try:
+                relative = file_path.resolve().relative_to(managed_root)
+            except ValueError:
+                relative = None
+            if relative is not None and len(relative.parts) >= 2 and re.fullmatch(r"[0-9a-f]{32}", relative.parts[0]):
+                return
+            count = _index_file(self.processor, self.memory, file_path)
+            logger.info(f"Indexed {count} chunks from {file_path}")
         except SecurityError as e:
             logger.debug(f"Skipped {file_path}: {e}")
         except Exception as e:
@@ -417,10 +473,7 @@ class FileIngestionService:
         Returns:
             Number of chunks indexed
         """
-        documents = list(self.processor.process_file(file_path))
-        if documents:
-            self.memory.add_documents(documents)
-        return len(documents)
+        return _index_file(self.processor, self.memory, file_path)
 
     def ingest_directory(
         self,
