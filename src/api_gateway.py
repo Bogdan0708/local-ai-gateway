@@ -837,6 +837,7 @@ class AgentRequest(BaseModel):
     """Request to run an agent workflow."""
     task: str = Field(..., description="Task description for the agent")
     agent_type: str = Field(default="devops", description="Type of agent: devops or research")
+    sources: list[str] = Field(default_factory=list, description="Source texts for the research agent")
 
 
 class AgentResponse(BaseModel):
@@ -913,7 +914,6 @@ async def run_devops_agent(
 async def run_research_agent(
     request: Request,
     agent_request: AgentRequest,
-    sources: list[str] = [],
     auth: TokenData = Depends(require_auth),
 ):
     """
@@ -947,7 +947,7 @@ async def run_research_agent(
         agent = ResearchAgent()
         result = await agent.run(
             query=agent_request.task,
-            sources=sources
+            sources=agent_request.sources
         )
 
         return AgentResponse(
