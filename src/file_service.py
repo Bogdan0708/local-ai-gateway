@@ -32,11 +32,8 @@ from watchdog.observers import Observer
 from .config import get_file_whitelist, get_settings
 from .memory import Document, get_memory
 from .chunking import (
-    AdaptiveChunker,
     ChunkConfig,
     ChunkingStrategy,
-    SemanticChunker,
-    StructureAwareChunker,
     get_chunker,
 )
 
@@ -252,7 +249,6 @@ class DocumentProcessor:
         full_text = "\n\n".join(doc.page_content for doc in documents)
 
         # Detect content type
-        suffix = file_path.suffix.lower()
         content_type = mimetypes.guess_type(str(file_path))[0] or "text/plain"
 
         # Get appropriate chunker

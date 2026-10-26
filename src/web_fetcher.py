@@ -15,17 +15,14 @@ Security improvements (2025-12-31):
 - Added IP caching with configurable TTL
 """
 
-import fnmatch
 import hashlib
 import ipaddress
 import logging
-import re
 import socket
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import List, Optional, Tuple
 import os
 import tempfile

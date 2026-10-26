@@ -22,7 +22,7 @@ Usage in PAI:
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from .auth import TokenData, require_local_or_auth
+from .auth import require_local_or_auth
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 import logging

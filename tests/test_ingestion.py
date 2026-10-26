@@ -1,6 +1,4 @@
-import pytest
 from unittest.mock import MagicMock, patch
-from pathlib import Path
 from src.file_service import FileIngestionService
 
 def test_ingest_file(tmp_path):

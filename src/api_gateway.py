@@ -16,14 +16,13 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -491,7 +490,6 @@ async def chat_completions(
     Supports both streaming (stream=true) and non-streaming responses.
     Also supports RAG context retrieval from the knowledge base.
     """
-    settings = get_settings()
     messages = [{"role": m.role, "content": m.content} for m in chat_request.messages]
 
     # RAG: Retrieve relevant context
@@ -1168,7 +1166,6 @@ async def internal_chat(
     Allows localhost access without authentication.
     Supports streaming (stream=true) and returns RAG sources.
     """
-    settings = get_settings()
     messages = [{"role": m.role, "content": m.content} for m in chat_request.messages]
     rag_sources = []
 

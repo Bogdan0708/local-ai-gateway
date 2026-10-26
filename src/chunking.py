@@ -227,7 +227,6 @@ class SemanticChunker:
 
         # Get embeddings for all sentences
         try:
-            import numpy as np
 
             embeddings = self.model.encode(sentences, convert_to_numpy=True)
         except Exception as e:
@@ -322,7 +321,6 @@ class StructureAwareChunker:
 
         for line in text.split('\n'):
             # Check for headers
-            header_found = False
             for pattern, level in self.MD_HEADERS:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
@@ -348,7 +346,6 @@ class StructureAwareChunker:
                     for lower in levels[level_idx + 1:]:
                         current_headers.pop(lower, None)
 
-                    header_found = True
                     break
 
             current_content.append(line)
