@@ -26,34 +26,34 @@ Normalize chunker calls, remove cancelled pending jobs, and correct live-check g
 
 **Files:** Merge tracked security branch changes; resolve .github/workflows/ci.yml.
 **Interfaces:** Produces integrated ingestion/media behavior and existing public APIs.
-- [ ] Merge 14274df into isolated branch based on aabc461; keep Ruff and pip check in CI.
-- [ ] Run full offline pytest baseline; expected 291 passed.
-- [ ] Verify Ruff; fix integration-only lint regressions without behavior changes.
-- [ ] Commit merge and design/plan.
+- [x] Merge 14274df into isolated branch based on aabc461; keep Ruff and pip check in CI.
+- [x] Run full offline pytest baseline; expected 291 passed.
+- [x] Verify Ruff; fix integration-only lint regressions without behavior changes.
+- [x] Commit merge and design/plan.
 
 ### Task 2: Normalize chunker interfaces
 
 **Files:** src/chunking.py; tests/test_chunking_strategies.py.
 **Interfaces:** get_chunker(config).chunk(text, content_type=None, filename=None).
-- [ ] Add regressions exercising DocumentProcessor across recursive, semantic and structure strategies, including content, provenance, HTML and semantic fallback.
-- [ ] Run focused tests; expected failures for incompatible keywords or missing chunk method.
-- [ ] Implement a consistent chunker interface and structure dispatch; preserve algorithms and adaptive behavior.
-- [ ] Run focused chunking/ingestion tests; expected pass, then commit.
+- [x] Add regressions exercising DocumentProcessor across recursive, semantic and structure strategies, including content, provenance, HTML and semantic fallback.
+- [x] Run focused tests; expected failures for incompatible keywords or missing chunk method.
+- [x] Implement a consistent chunker interface and structure dispatch; preserve algorithms and adaptive behavior.
+- [x] Run focused chunking/ingestion tests; expected pass, then commit.
 
 ### Task 3: Remove cancelled pending entries
 
 **Files:** src/media_jobs.py; tests/test_media_lifecycle.py.
 **Interfaces:** MediaJobManager.enqueue/cancel/queued_count and worker; preserve API capacity semantics.
-- [ ] Add regressions with a blocked active job, repeated queued cancellation, surviving FIFO jobs, capacity refusal and worker wakeup.
-- [ ] Run focused tests; expected failure from retained cancelled entries.
-- [ ] Implement bounded pending storage with immediate removal and existing active cleanup semantics.
-- [ ] Run media tests; expected pass, then commit.
+- [x] Add regressions with a blocked active job, repeated queued cancellation, surviving FIFO jobs, capacity refusal and worker wakeup.
+- [x] Run focused tests; expected failure from retained cancelled entries.
+- [x] Implement bounded pending storage with immediate removal and existing active cleanup semantics.
+- [x] Run media tests; expected pass, then commit.
 
 ### Task 4: Correct live-check instructions
 
 **Files:** .claude/skills/live-check/SKILL.md; CLAUDE.md.
 **Interfaces:** Existing operator instructions only; no automatic service actions.
-- [ ] Simulate old instructions against nondefault port/provider and an unrelated listener; record wrong target.
-- [ ] Derive endpoints from effective Settings, verify process command and resolved checkout, and scope restarts/inference to explicit user authorization.
-- [ ] Simulate corrected instructions against same scenario; expected correct endpoints and refusal to stop unrelated listener.
+- [x] Simulate old instructions against nondefault port/provider and an unrelated listener; record wrong target.
+- [x] Derive endpoints from effective Settings, verify process command and resolved checkout, and scope restarts/inference to explicit user authorization.
+- [x] Simulate corrected instructions against same scenario; expected correct endpoints and refusal to stop unrelated listener.
 - [ ] Commit guidance, run full suite/lint/pip check/secret scans and independent final review.

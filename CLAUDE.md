@@ -35,5 +35,5 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Workflow
 
 - Changes land via branch (`fix/<slug>`, `feat/<slug>`) → PR to `main` → CI green → squash merge. Commits use Conventional Commits: `type(scope): lowercase summary` (scopes like `agents`, `media`, `llm`, `auth`, `fetch`).
-- Done means pytest passes **and** a live check: restart the gateway and exercise the changed endpoint against the LM Studio hub on `localhost:1234` (use `/live-check`).
-- Stop the gateway by PID (`ss -ltnp | grep :8000`), never `pkill -f run.py` — the pattern matches the invoking shell and kills it.
+- Validate changes with pytest and Ruff. Report live acceptance separately: use `/live-check` when the user authorizes service restart and inference against the configured backend. Code edits and offline reviews do not authorize live actions; preserve any GPU pause or test budget.
+- Before an authorized restart, resolve `HOST`/`PORT` through Settings and verify the listener PID belongs to this checkout using both `/proc/<pid>/cwd` and `/proc/<pid>/cmdline`. Leave unrelated or unverifiable processes running. Follow `/live-check`; never `pkill -f run.py`.
