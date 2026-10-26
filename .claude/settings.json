@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // .tool_response.filePath'); case \"$f\" in *.py) out=$(\"$CLAUDE_PROJECT_DIR\"/.venv/bin/ruff check --output-format concise --quiet \"$f\" 2>&1) || { echo \"ruff: $out\" >&2; exit 2; };; esac",
+            "command": "f=$(jq -r '.tool_input.file_path // .tool_response.filePath'); case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/*.py) out=$(\"$CLAUDE_PROJECT_DIR\"/.venv/bin/ruff check --output-format concise --quiet \"$f\" 2>&1) || { echo \"ruff: $out\" >&2; exit 2; };; esac",
             "timeout": 30,
             "statusMessage": "ruff check"
           }
