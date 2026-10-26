@@ -96,7 +96,9 @@ class RecursiveChunker:
     def __init__(self, config: Optional[ChunkConfig] = None):
         self.config = config or ChunkConfig()
 
-    def chunk(self, text: str) -> List[Chunk]:
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
         """Split text into chunks using recursive splitting."""
         if not text or not text.strip():
             return []
@@ -209,7 +211,9 @@ class SemanticChunker:
 
         return self._model
 
-    def chunk(self, text: str) -> List[Chunk]:
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
         """Split text based on semantic similarity."""
         if not text or not text.strip():
             return []
@@ -309,6 +313,16 @@ class StructureAwareChunker:
     def __init__(self, config: Optional[ChunkConfig] = None):
         self.config = config or ChunkConfig()
         self.recursive = RecursiveChunker(config)
+
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
+        """Select HTML or Markdown structure using the document's type hints."""
+        if not text or not text.strip():
+            return []
+        if _detect_content_type(content_type, filename, text) == "html":
+            return self.chunk_html(text)
+        return self.chunk_markdown(text)
 
     def chunk_markdown(self, text: str) -> List[Chunk]:
         """Chunk Markdown preserving header hierarchy."""
@@ -471,7 +485,7 @@ class AdaptiveChunker:
             return []
 
         # Detect content type from filename if not provided
-        detected_type = self._detect_type(content_type, filename, text)
+        detected_type = _detect_content_type(content_type, filename, text)
 
         # Select strategy based on content type
         if detected_type == "markdown":
@@ -495,37 +509,37 @@ class AdaptiveChunker:
                 logger.debug("Using recursive chunking")
                 return self.recursive.chunk(text)
 
-    def _detect_type(
-        self,
-        content_type: Optional[str],
-        filename: Optional[str],
-        text: str,
-    ) -> str:
-        """Detect content type from various signals."""
-        # Check explicit content type
-        if content_type:
-            if "markdown" in content_type.lower():
-                return "markdown"
-            if "html" in content_type.lower():
-                return "html"
 
-        # Check filename extension
-        if filename:
-            ext = Path(filename).suffix.lower()
-            if ext in (".md", ".markdown"):
-                return "markdown"
-            if ext in (".html", ".htm"):
-                return "html"
-            if ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp"):
-                return "code"
-
-        # Check content patterns
-        if text.startswith("<!DOCTYPE") or "<html" in text[:1000]:
-            return "html"
-        if re.search(r'^#{1,6}\s', text, re.MULTILINE):
+def _detect_content_type(
+    content_type: Optional[str],
+    filename: Optional[str],
+    text: str,
+) -> str:
+    """Detect content type from various signals."""
+    # Check explicit content type
+    if content_type:
+        if "markdown" in content_type.lower():
             return "markdown"
+        if "html" in content_type.lower():
+            return "html"
 
-        return "text"
+    # Check filename extension
+    if filename:
+        ext = Path(filename).suffix.lower()
+        if ext in (".md", ".markdown"):
+            return "markdown"
+        if ext in (".html", ".htm"):
+            return "html"
+        if ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp"):
+            return "code"
+
+    # Check content patterns
+    if text.startswith("<!DOCTYPE") or "<html" in text[:1000]:
+        return "html"
+    if re.search(r'^#{1,6}\s', text, re.MULTILINE):
+        return "markdown"
+
+    return "text"
 
 
 # Convenience functions
@@ -547,16 +561,7 @@ def chunk_text(
     """
     config = ChunkConfig(strategy=strategy, **kwargs)
 
-    if strategy == ChunkingStrategy.SEMANTIC:
-        chunker = SemanticChunker(config)
-    elif strategy == ChunkingStrategy.STRUCTURE:
-        chunker = StructureAwareChunker(config)
-    elif strategy == ChunkingStrategy.RECURSIVE:
-        chunker = RecursiveChunker(config)
-    else:
-        chunker = AdaptiveChunker(config)
-
-    return chunker.chunk(text)
+    return get_chunker(config).chunk(text)
 
 
 def chunk_document(
@@ -577,7 +582,7 @@ def chunk_document(
     Returns:
         List of chunks with metadata
     """
-    chunker = AdaptiveChunker(config)
+    chunker = get_chunker(config or ChunkConfig())
     return chunker.chunk(text, content_type, filename)
 
 
