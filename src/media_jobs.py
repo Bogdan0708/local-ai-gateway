@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import secrets
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,13 +28,14 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .auth import require_auth
-from .comfyui_client import ComfyUIClient, ComfyUIError
+from .comfyui_client import ComfyUIClient, ComfyUIError, DEFAULT_MAX_OUTPUT_BYTES
 from .config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 2.0
-MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
+REMOTE_CLEANUP_TIMEOUT_S = 5.0
 MAX_RETAINED_JOBS = 500  # finished jobs kept in memory
 PARAM_TYPES = {"integer", "string"}
 
@@ -112,8 +112,13 @@ def write_output(root: Path, job_id: str, index: int, ext: str, data: bytes) -> 
             if exc.errno in (errno.EEXIST, errno.ELOOP):
                 raise UnsafeOutputPath("output target already exists or is a symlink") from exc
             raise
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except BaseException:
+            # Only this newly created file is ours; never delete an existing target.
+            os.unlink(name, dir_fd=dir_fd)
+            raise
     finally:
         os.close(dir_fd)
     return job_dir / name
@@ -271,6 +276,8 @@ class Job:
     error: Optional[str] = None
     prompt_id: Optional[str] = None
     outputs: list[dict] = field(default_factory=list)  # {index, ext, content_type, size}
+    _settled: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _saved_outputs: list[tuple[int, str]] = field(default_factory=list, repr=False)
 
     def finish(self, status: str, error: Optional[str] = None) -> None:
         if self.status in FINISHED:
@@ -296,37 +303,74 @@ class Job:
         }
 
 
+class PendingJobQueue(asyncio.Queue[str]):
+    """FIFO queue whose cancelled waiting entries can release capacity immediately."""
+
+    def discard(self, job_id: str) -> None:
+        # Extend Queue in place so its waiting worker, join accounting and
+        # producer wakeups retain the same queue identity.
+        try:
+            self._queue.remove(job_id)
+        except ValueError:
+            return
+        self.task_done()
+        self._wakeup_next(self._putters)
+
+
 class MediaJobManager:
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
         self.settings: Optional[Settings] = None
-        self._queue: Optional[asyncio.Queue] = None
+        self._queue: Optional[PendingJobQueue] = None
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[ComfyUIClient] = None
+        self._active_job: Optional[Job] = None
+        self._job_task: Optional[asyncio.Task] = None
+        self._stopping = False
 
     async def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("Media worker is already started")
         self.settings = get_settings()
         self.jobs = {}
-        self._queue = asyncio.Queue()
+        self._queue = PendingJobQueue(maxsize=self.settings.media_max_queued_jobs)
         self._client = make_comfy_client(self.settings)
+        self._stopping = False
         self._task = asyncio.create_task(self._worker(), name="media-job-worker")
 
     async def stop(self) -> None:
+        self._stopping = True
+        for job in self.jobs.values():
+            if job.status not in FINISHED:
+                job.finish(CANCELLED, "gateway shutting down")
+                if job is not self._active_job:
+                    self._queue.discard(job.id)
+                    job.graph = {}
+                    job._settled.set()
+        active = self._active_job
+        if active is not None:
+            if self._job_task is not None and not self._job_task.done():
+                self._job_task.cancel()
+            # Do not cancel the worker while it is cleaning up remote work/files.
+            await active._settled.wait()
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
-            self._task = None
         if self._client:
             await self._client.aclose()
             self._client = None
         self._queue = None
+        self._task = None
 
     @property
     def ready(self) -> bool:
-        return self._queue is not None and self.settings is not None
+        return (
+            not self._stopping and self._queue is not None and self.settings is not None
+            and self._task is not None and not self._task.done()
+        )
 
     def queued_count(self) -> int:
         return sum(1 for j in self.jobs.values() if j.status == QUEUED)
@@ -338,65 +382,134 @@ class MediaJobManager:
 
     def enqueue(self, job: Job) -> None:
         self._prune()
-        self.jobs[job.id] = job
         self._queue.put_nowait(job.id)
+        self.jobs[job.id] = job
 
     async def cancel(self, job: Job) -> None:
-        was_running = job.status == RUNNING
+        if job.status in FINISHED:
+            return
         job.finish(CANCELLED)
-        if was_running and job.prompt_id:
-            await self._cancel_in_comfy(job.prompt_id)
+        if job is self._active_job:
+            if self._job_task is not None and not self._job_task.done():
+                self._job_task.cancel()
+            await job._settled.wait()
+        else:
+            self._queue.discard(job.id)
+            job.graph = {}
+            job._settled.set()
 
     async def _cancel_in_comfy(self, prompt_id: str) -> None:
         try:
-            await self._client.delete_queued(prompt_id)
-        except ComfyUIError as exc:
-            logger.warning("ComfyUI queue removal failed: %s", exc)
-        try:
-            running = (await self._client.queue()).get("queue_running") or []
-            ours = any(
-                isinstance(e, list) and len(e) > 1 and e[1] == prompt_id for e in running
-            )
-            if ours:
-                await self._client.interrupt(prompt_id)
-        except ComfyUIError as exc:
-            logger.warning("ComfyUI interrupt failed: %s", exc)
+            async with asyncio.timeout(REMOTE_CLEANUP_TIMEOUT_S):
+                await self._client.cancel(prompt_id)
+        except (ComfyUIError, TimeoutError) as exc:
+            logger.warning("ComfyUI cancellation could not be confirmed for %s: %s", prompt_id, exc)
 
     async def _worker(self) -> None:
+        queue = self._queue
         while True:
-            job_id = await self._queue.get()
+            job_id = await queue.get()
             job = self.jobs.get(job_id)
             if job is None or job.status != QUEUED:
+                queue.task_done()
                 continue  # cancelled while waiting
             job.status = RUNNING
             job.started_at = _now()
+            self._active_job = job
+            self._job_task = asyncio.create_task(self._run(job), name=f"media-job-{job.id}")
+            worker_cancelled = False
             try:
-                await self._run(job)
+                async with asyncio.timeout(self.settings.media_job_timeout_s):
+                    await self._job_task
+            except TimeoutError:
+                job.finish(FAILED, f"timed out after {self.settings.media_job_timeout_s} s")
             except asyncio.CancelledError:
-                raise
+                job.finish(CANCELLED)
+                worker_cancelled = bool(asyncio.current_task().cancelling())
             except ComfyUIError as exc:
                 job.finish(FAILED, str(exc))
-                await self._discard_remote(job)
             except UnsafeOutputPath as exc:
                 logger.error("Refused unsafe output for job %s: %s", job.id, exc)
                 job.finish(FAILED, f"refused to write output: {exc}")
             except Exception:
                 logger.exception("Media job %s crashed", job.id)
                 job.finish(FAILED, "internal error")
+            else:
+                if job.status == RUNNING:
+                    job.finish(SUCCEEDED)
+            finally:
+                try:
+                    if job.status != SUCCEEDED:
+                        try:
+                            await self._discard_remote(job)
+                        except Exception:
+                            logger.exception("Remote cleanup failed for job %s", job.id)
+                        finally:
+                            self._remove_saved_outputs(job)
+                finally:
+                    job.graph = {}
+                    self._active_job = None
+                    self._job_task = None
+                    job._settled.set()
+                    queue.task_done()
+            if worker_cancelled:
+                raise asyncio.CancelledError
+            if self._stopping:
+                return
 
     async def _discard_remote(self, job: Job) -> None:
         if job.prompt_id:
             await self._cancel_in_comfy(job.prompt_id)
 
+    def _remove_saved_outputs(self, job: Job) -> None:
+        job.outputs = []
+        if not job._saved_outputs:
+            return
+        try:
+            directory = _job_dir(self.settings.media_output_dir, job.id, create=False)
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                for index, ext in job._saved_outputs:
+                    try:
+                        os.unlink(f"{index}.{ext}", dir_fd=fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(fd)
+        except (OSError, UnsafeOutputPath):
+            logger.exception("Could not remove incomplete outputs for job %s", job.id)
+        finally:
+            job._saved_outputs = []
+
+    async def _write_image(self, job: Job, index: int, ext: str, data: bytes) -> None:
+        writer = asyncio.create_task(asyncio.to_thread(
+            write_output, self.settings.media_output_dir, job.id, index, ext, data,
+        ))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(writer)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if writer.cancelled():
+                    raise
+            except Exception:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+        job._saved_outputs.append((index, ext))
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def _run(self, job: Job) -> None:
-        settings, client = self.settings, self._client
-        job.prompt_id = await client.submit(job.graph)
+        client = self._client
+        job.prompt_id = str(uuid.uuid4())
+        await client.submit(job.graph, prompt_id=job.prompt_id)
         job.graph = {}  # no longer needed; keeps the job store small
         if job.status == CANCELLED:  # cancelled while submitting
-            await self._cancel_in_comfy(job.prompt_id)
             return
 
-        deadline = time.monotonic() + settings.media_job_timeout_s
         while True:
             entry = await client.history(job.prompt_id)
             if job.status == CANCELLED:
@@ -405,10 +518,6 @@ class MediaJobManager:
                 status = entry.get("status") or {}
                 if status.get("completed") or status.get("status_str") in ("success", "error"):
                     break
-            if time.monotonic() >= deadline:
-                await self._cancel_in_comfy(job.prompt_id)
-                job.finish(FAILED, f"timed out after {settings.media_job_timeout_s} s")
-                return
             await asyncio.sleep(POLL_INTERVAL_S)
 
         if status.get("status_str") == "error":
@@ -433,17 +542,19 @@ class MediaJobManager:
                 job.finish(FAILED, "workflow produced an unsupported output type")
                 return
             data = await client.fetch_output(
-                str(img["filename"]), str(img.get("subfolder", "")), str(img.get("type", "output"))
+                str(img["filename"]), str(img.get("subfolder", "")), str(img.get("type", "output")),
+                max_bytes=MAX_OUTPUT_BYTES,
             )
+            if job.status == CANCELLED:
+                return
             if len(data) > MAX_OUTPUT_BYTES:
                 job.finish(FAILED, "output image too large")
                 return
-            await asyncio.to_thread(write_output, settings.media_output_dir, job.id, index, ext, data)
+            await self._write_image(job, index, ext, data)
             outputs.append({"index": index, "ext": ext, "content_type": CONTENT_TYPES[ext], "size": len(data)})
         if job.status == CANCELLED:
             return
         job.outputs = outputs
-        job.finish(SUCCEEDED)
 
     @staticmethod
     def _execution_error(status: dict) -> str:
@@ -510,7 +621,10 @@ async def create_job(request: JobRequest) -> dict:
     if manager.queued_count() >= settings.media_max_queued_jobs:
         raise HTTPException(status_code=429, detail="Media job queue is full")
     job = Job(id=new_job_id(), workflow=request.workflow, params=values, graph=built)
-    manager.enqueue(job)
+    try:
+        manager.enqueue(job)
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=429, detail="Media job queue is full")
     return {"id": job.id, "status": job.status}
 
 

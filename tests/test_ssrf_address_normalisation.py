@@ -15,6 +15,7 @@ import pytest
 from src.web_fetcher import SafeDNSResolver, SecurityError, WebFetcher
 
 PUBLIC_A = "93.184.216.34"
+PUBLIC_V6 = "2606:2800:220:1:248:1893:25c8:1946"
 
 # (literal, what it really reaches)
 EMBEDDED_INTERNAL = [
@@ -50,6 +51,31 @@ def test_validate_ip_still_accepts_public_addresses():
     resolver._validate_ip(PUBLIC_A, "example.test")
     resolver._validate_ip("2606:2800:220:1:248:1893:25c8:1946", "example.test")
     resolver._validate_ip(f"::ffff:{PUBLIC_A}", "example.test")
+
+
+@pytest.mark.parametrize("addresses,expected", [
+    ([(socket.AF_INET, PUBLIC_A), (socket.AF_INET6, PUBLIC_V6), (socket.AF_INET, PUBLIC_A)], PUBLIC_A),
+    ([(socket.AF_INET6, PUBLIC_V6), (socket.AF_INET, PUBLIC_A), (socket.AF_INET6, PUBLIC_V6)], PUBLIC_V6),
+])
+def test_dns_resolution_preserves_os_address_preference(addresses, expected):
+    records = [
+        (family, socket.SOCK_STREAM, 6, "", (address, 0, 0, 0) if family == socket.AF_INET6 else (address, 0))
+        for family, address in addresses
+    ]
+    resolver = SafeDNSResolver()
+    with patch("socket.getaddrinfo", return_value=records):
+        assert resolver.resolve_and_validate("https://example.test/") == ("example.test", expected)
+        assert resolver.resolve_and_validate("https://example.test/cached") == ("example.test", expected)
+
+
+def test_dns_resolution_checks_all_answers_before_choosing_first():
+    records = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_A, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+    ]
+    with patch("socket.getaddrinfo", return_value=records):
+        with pytest.raises(SecurityError):
+            SafeDNSResolver().resolve_and_validate("https://example.test/")
 
 
 @pytest.mark.parametrize("literal,description", EMBEDDED_INTERNAL)

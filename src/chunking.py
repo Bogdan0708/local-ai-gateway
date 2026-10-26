@@ -96,7 +96,9 @@ class RecursiveChunker:
     def __init__(self, config: Optional[ChunkConfig] = None):
         self.config = config or ChunkConfig()
 
-    def chunk(self, text: str) -> List[Chunk]:
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
         """Split text into chunks using recursive splitting."""
         if not text or not text.strip():
             return []
@@ -209,7 +211,9 @@ class SemanticChunker:
 
         return self._model
 
-    def chunk(self, text: str) -> List[Chunk]:
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
         """Split text based on semantic similarity."""
         if not text or not text.strip():
             return []
@@ -227,7 +231,6 @@ class SemanticChunker:
 
         # Get embeddings for all sentences
         try:
-            import numpy as np
 
             embeddings = self.model.encode(sentences, convert_to_numpy=True)
         except Exception as e:
@@ -311,6 +314,16 @@ class StructureAwareChunker:
         self.config = config or ChunkConfig()
         self.recursive = RecursiveChunker(config)
 
+    def chunk(
+        self, text: str, content_type: Optional[str] = None, filename: Optional[str] = None,
+    ) -> List[Chunk]:
+        """Select HTML or Markdown structure using the document's type hints."""
+        if not text or not text.strip():
+            return []
+        if _detect_content_type(content_type, filename, text) == "html":
+            return self.chunk_html(text)
+        return self.chunk_markdown(text)
+
     def chunk_markdown(self, text: str) -> List[Chunk]:
         """Chunk Markdown preserving header hierarchy."""
         if not text or not text.strip():
@@ -322,14 +335,13 @@ class StructureAwareChunker:
 
         for line in text.split('\n'):
             # Check for headers
-            header_found = False
             for pattern, level in self.MD_HEADERS:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
                     # Save previous chunk if exists
                     if current_content:
                         chunk_text = '\n'.join(current_content)
-                        if len(chunk_text) >= self.config.min_chunk_size:
+                        if chunk_text.strip():
                             chunks.append(Chunk(
                                 content=chunk_text,
                                 metadata={
@@ -348,7 +360,6 @@ class StructureAwareChunker:
                     for lower in levels[level_idx + 1:]:
                         current_headers.pop(lower, None)
 
-                    header_found = True
                     break
 
             current_content.append(line)
@@ -356,7 +367,7 @@ class StructureAwareChunker:
         # Don't forget the last chunk
         if current_content:
             chunk_text = '\n'.join(current_content)
-            if len(chunk_text) >= self.config.min_chunk_size:
+            if chunk_text.strip():
                 chunks.append(Chunk(
                     content=chunk_text,
                     metadata={
@@ -388,52 +399,51 @@ class StructureAwareChunker:
         """Chunk HTML preserving header hierarchy."""
         # Extract text from HTML first
         try:
-            from bs4 import BeautifulSoup
+            from bs4 import BeautifulSoup, Comment, Doctype, NavigableString
 
             soup = BeautifulSoup(text, 'html.parser')
-
             chunks = []
             current_content = []
             current_headers = {}
+            headings = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+            hidden = {'head', 'script', 'style', 'template', 'noscript'}
+            blocks = headings | {
+                'body', 'div', 'p', 'li', 'ul', 'ol', 'table', 'tr', 'td', 'th',
+                'section', 'article', 'header', 'footer', 'main', 'aside', 'nav',
+                'blockquote', 'pre', 'figure', 'figcaption', 'dl', 'dt', 'dd',
+            }
+            last_block = None
 
-            # Process all elements
-            for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'pre', 'code', 'div']):
-                if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                    # Save previous chunk
-                    if current_content:
-                        chunk_text = '\n'.join(current_content)
-                        if len(chunk_text) >= self.config.min_chunk_size:
-                            chunks.append(Chunk(
-                                content=chunk_text,
-                                metadata={
-                                    "strategy": "structure",
-                                    "headers": current_headers.copy()
-                                },
-                                index=len(chunks)
-                            ))
-                        current_content = []
-
-                    # Update header
-                    current_headers[element.name] = element.get_text().strip()
-
-                else:
-                    text = element.get_text().strip()
-                    if text:
-                        current_content.append(text)
-
-            # Last chunk
-            if current_content:
-                chunk_text = '\n'.join(current_content)
-                if len(chunk_text) >= self.config.min_chunk_size:
+            def save_section():
+                chunk_text = ''.join(current_content).strip()
+                if chunk_text:
                     chunks.append(Chunk(
                         content=chunk_text,
-                        metadata={
-                            "strategy": "structure",
-                            "headers": current_headers.copy()
-                        },
+                        metadata={"strategy": "structure", "headers": current_headers.copy()},
                         index=len(chunks)
                     ))
+                current_content.clear()
 
+            # Text nodes preserve inline adjacency; block ancestors introduce
+            # separators. Reading container .get_text() would duplicate children.
+            for element in soup.descendants:
+                name = getattr(element, 'name', None)
+                if name in hidden or any(parent.name in hidden for parent in element.parents):
+                    continue
+                if name in headings:
+                    save_section()
+                    current_headers[name] = element.get_text().strip()
+                    last_block = None
+                elif name in {'br', 'hr'}:
+                    current_content.append('\n')
+                elif isinstance(element, NavigableString) and not isinstance(element, (Comment, Doctype)):
+                    block = next((parent for parent in element.parents if parent.name in blocks), soup)
+                    if current_content and block is not last_block:
+                        current_content.append('\n')
+                    current_content.append(str(element))
+                    last_block = block
+
+            save_section()
             return chunks
 
         except ImportError:
@@ -475,7 +485,7 @@ class AdaptiveChunker:
             return []
 
         # Detect content type from filename if not provided
-        detected_type = self._detect_type(content_type, filename, text)
+        detected_type = _detect_content_type(content_type, filename, text)
 
         # Select strategy based on content type
         if detected_type == "markdown":
@@ -499,37 +509,37 @@ class AdaptiveChunker:
                 logger.debug("Using recursive chunking")
                 return self.recursive.chunk(text)
 
-    def _detect_type(
-        self,
-        content_type: Optional[str],
-        filename: Optional[str],
-        text: str,
-    ) -> str:
-        """Detect content type from various signals."""
-        # Check explicit content type
-        if content_type:
-            if "markdown" in content_type.lower():
-                return "markdown"
-            if "html" in content_type.lower():
-                return "html"
 
-        # Check filename extension
-        if filename:
-            ext = Path(filename).suffix.lower()
-            if ext in (".md", ".markdown"):
-                return "markdown"
-            if ext in (".html", ".htm"):
-                return "html"
-            if ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp"):
-                return "code"
-
-        # Check content patterns
-        if text.startswith("<!DOCTYPE") or "<html" in text[:1000]:
-            return "html"
-        if re.search(r'^#{1,6}\s', text, re.MULTILINE):
+def _detect_content_type(
+    content_type: Optional[str],
+    filename: Optional[str],
+    text: str,
+) -> str:
+    """Detect content type from various signals."""
+    # Check explicit content type
+    if content_type:
+        if "markdown" in content_type.lower():
             return "markdown"
+        if "html" in content_type.lower():
+            return "html"
 
-        return "text"
+    # Check filename extension
+    if filename:
+        ext = Path(filename).suffix.lower()
+        if ext in (".md", ".markdown"):
+            return "markdown"
+        if ext in (".html", ".htm"):
+            return "html"
+        if ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp"):
+            return "code"
+
+    # Check content patterns
+    if text.startswith("<!DOCTYPE") or "<html" in text[:1000]:
+        return "html"
+    if re.search(r'^#{1,6}\s', text, re.MULTILINE):
+        return "markdown"
+
+    return "text"
 
 
 # Convenience functions
@@ -551,16 +561,7 @@ def chunk_text(
     """
     config = ChunkConfig(strategy=strategy, **kwargs)
 
-    if strategy == ChunkingStrategy.SEMANTIC:
-        chunker = SemanticChunker(config)
-    elif strategy == ChunkingStrategy.STRUCTURE:
-        chunker = StructureAwareChunker(config)
-    elif strategy == ChunkingStrategy.RECURSIVE:
-        chunker = RecursiveChunker(config)
-    else:
-        chunker = AdaptiveChunker(config)
-
-    return chunker.chunk(text)
+    return get_chunker(config).chunk(text)
 
 
 def chunk_document(
@@ -581,7 +582,7 @@ def chunk_document(
     Returns:
         List of chunks with metadata
     """
-    chunker = AdaptiveChunker(config)
+    chunker = get_chunker(config or ChunkConfig())
     return chunker.chunk(text, content_type, filename)
 
 

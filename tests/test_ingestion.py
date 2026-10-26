@@ -1,6 +1,4 @@
-import pytest
 from unittest.mock import MagicMock, patch
-from pathlib import Path
 from src.file_service import FileIngestionService
 
 def test_ingest_file(tmp_path):
@@ -28,9 +26,9 @@ def test_ingest_file(tmp_path):
                 count = service.ingest_file(file_path)
                 
                 assert count == 1
-                mock_memory.add_documents.assert_called_once()
-                args, _ = mock_memory.add_documents.call_args
-                docs = args[0]
+                mock_memory.replace_source.assert_called_once()
+                args, _ = mock_memory.replace_source.call_args
+                docs = args[1]
                 assert len(docs) == 1
                 assert docs[0].content == "Test content"
 
@@ -55,4 +53,4 @@ def test_ingest_directory(tmp_path):
                 results = service.ingest_directory(tmp_path)
                 
                 assert len(results) == 2
-                assert mock_memory.add_documents.call_count == 2
+                assert mock_memory.replace_source.call_count == 2
