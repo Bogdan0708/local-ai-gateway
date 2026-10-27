@@ -36,6 +36,7 @@ from .file_service import (
     SecurityError as FileSecurityError,
 )
 from .memory import Document, get_memory
+from .reasoning import ThinkStreamFilter, strip_think
 from .web_fetcher import FetchError, SecurityError, fetch_url, perform_search
 from .media_jobs import router as media_router, start_worker, stop_worker
 from .mcp_bridge import (  # MCP bridge for PAI integration
@@ -302,7 +303,7 @@ async def call_llm(
             response.raise_for_status()
             data = response.json()
             return {
-                "content": data["message"]["content"],
+                "content": strip_think(data["message"]["content"]),
                 "prompt_tokens": data.get("prompt_eval_count", 0),
                 "completion_tokens": data.get("eval_count", 0),
             }
@@ -323,7 +324,7 @@ async def call_llm(
             response.raise_for_status()
             data = response.json()
             return {
-                "content": data["choices"][0]["message"]["content"],
+                "content": strip_think(data["choices"][0]["message"]["content"]),
                 "prompt_tokens": data.get("usage", {}).get("prompt_tokens", 0),
                 "completion_tokens": data.get("usage", {}).get("completion_tokens", 0),
             }
@@ -362,6 +363,7 @@ async def _stream_ollama(
 ) -> AsyncGenerator[str, None]:
     """Stream from Ollama API."""
     settings = get_settings()
+    think = ThinkStreamFilter()
 
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
@@ -380,7 +382,9 @@ async def _stream_ollama(
 
                 try:
                     data = json.loads(line)
-                    content = data.get("message", {}).get("content", "")
+                    content = think.feed(data.get("message", {}).get("content", ""))
+                    if data.get("done", False):
+                        content += think.flush()
 
                     if content:
                         # Convert to OpenAI format
@@ -425,6 +429,7 @@ async def _stream_openai_compatible(
 ) -> AsyncGenerator[str, None]:
     """Stream from OpenAI-compatible API (LM Studio, etc.)."""
     settings = get_settings()
+    think = ThinkStreamFilter()
 
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
@@ -450,8 +455,23 @@ async def _stream_openai_compatible(
                 if data_str == "[DONE]":
                     break
 
-                # Pass through OpenAI format directly
-                yield f"data: {data_str}\n\n"
+                # Pass through OpenAI format, with inline <think> blocks removed from content
+                try:
+                    chunk = json.loads(data_str)
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta") or {}
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError, AttributeError):
+                    yield f"data: {data_str}\n\n"
+                    continue
+                if delta.get("content"):
+                    delta["content"] = think.feed(delta["content"])
+                if choice.get("finish_reason"):
+                    delta["content"] = delta.get("content", "") + think.flush()
+                if not delta.get("content"):
+                    delta.pop("content", None)
+                    if not delta and not choice.get("finish_reason"):
+                        continue  # the whole delta was thinking
+                yield f"data: {json.dumps(chunk)}\n\n"
 
 
 # === Endpoints ===

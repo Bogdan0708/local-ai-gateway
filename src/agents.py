@@ -16,6 +16,7 @@ import operator
 import logging
 
 from .config import Settings, get_settings
+from .reasoning import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ class DevOpsAgent:
                     "content": f"Task: {state['task']}\n\nProvide a concise implementation plan (3-5 bullet points)."
                 }
             ])
-            state["context"] = response.content
+            state["context"] = strip_think(response.content)
             state["iterations"] += 1
             logger.info("Task analysis complete")
         except Exception as e:
@@ -134,7 +135,7 @@ class DevOpsAgent:
                     "content": f"Architecture Plan:\n{state['context']}\n\nTask: {state['task']}\n\nGenerate the code:"
                 }
             ])
-            state["code"] = response.content
+            state["code"] = strip_think(response.content)
             state["iterations"] += 1
             logger.info("Code implementation complete")
         except Exception as e:
@@ -163,7 +164,7 @@ class DevOpsAgent:
                     "content": f"Task: {state['task']}\n\nCode:\n{state['code']}\n\nProvide review:"
                 }
             ])
-            state["review"] = response.content
+            state["review"] = strip_think(response.content)
             state["iterations"] += 1
             state["status"] = "completed"
             logger.info("Code review complete")
@@ -263,7 +264,7 @@ class ResearchAgent:
 
             return {
                 "query": query,
-                "synthesis": response.content,
+                "synthesis": strip_think(response.content),
                 "sources_used": len(sources),
                 "status": "completed"
             }

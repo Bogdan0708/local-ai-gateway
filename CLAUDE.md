@@ -30,6 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - There is exactly one FastAPI `app` in `src/api_gateway.py`. Never instantiate it again further down — that once silently dropped every route registered earlier.
 - Auth (`src/auth.py`): `require_auth` accepts `X-API-Key`, `Authorization: Bearer <API_KEY>`, or a JWT; `require_scope(...)` for scoped routes; `require_local_or_auth` guards internal `/api/*` and `/mcp/*`.
+- Model output never reaches clients raw: `call_llm`, both stream paths and the agents pass content through `src/reasoning.py` (`strip_think` / `ThinkStreamFilter`), because some local reasoning distills write `<think>…</think>` into the content and LM Studio can't split it for them. Keep new output paths behind it.
 - A FastAPI handler with two body parameters expects them wrapped by parameter name (`{"agent_request": {...}}`). Keep one Pydantic body model per endpoint so the documented flat JSON works.
 
 ## Workflow
